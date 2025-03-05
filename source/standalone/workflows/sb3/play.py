@@ -45,7 +45,7 @@ import numpy as np
 import os
 import torch
 
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.vec_env import VecNormalize
 
 from omni.isaac.lab.envs import DirectMARLEnv, multi_agent_to_single_agent
@@ -65,7 +65,7 @@ def main():
     agent_cfg = load_cfg_from_registry(args_cli.task, "sb3_cfg_entry_point")
 
     # directory for logging into
-    log_root_path = os.path.join("logs", "sb3", args_cli.task)
+    log_root_path = os.path.join("logs", "sb3", agent_cfg["name"], agent_cfg["algorithm"])
     log_root_path = os.path.abspath(log_root_path)
     # check checkpoint is valid
     if args_cli.checkpoint is None:
@@ -116,7 +116,12 @@ def main():
 
     # create agent from stable baselines
     print(f"Loading checkpoint from: {checkpoint_path}")
-    agent = PPO.load(checkpoint_path, env, print_system_info=True)
+    if agent_cfg["algorithm"] == "sac":
+        agent = SAC.load(checkpoint_path, env, print_system_info=True)
+    elif agent_cfg["algorithm"] == "ppo":
+        agent = PPO.load(checkpoint_path, env, print_system_info=True)
+    else:
+        raise ValueError(f"Policy architecture not supported")
 
     # reset environment
     obs = env.reset()

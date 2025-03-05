@@ -186,7 +186,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             px = world_pos[0] - env_pos[0]
             py = world_pos[1] - env_pos[1]
             pz = world_pos[2] - env_pos[2]
-            qx = world_quat.imaginary[0]
+            qx = world_quat.imaginary[0]    
             qy = world_quat.imaginary[1]
             qz = world_quat.imaginary[2]
             qw = world_quat.real
@@ -294,6 +294,8 @@ class FrankaCabinetEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         terminated = self._cabinet.data.joint_pos[:, 3] > 0.39
         truncated = self.episode_length_buf >= self.max_episode_length - 1
+        print(f'Timesout: {self.episode_length_buf} >= {self.max_episode_length -1}')
+
         return terminated, truncated
 
     def _get_rewards(self) -> torch.Tensor:

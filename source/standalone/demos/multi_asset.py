@@ -244,6 +244,7 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene):
             rigid_object.write_root_velocity_to_sim(root_state[:, 7:])
             # object collection
             object_state = rigid_object_collection.data.default_object_state.clone()
+            # print('object_state shape', object_state.shape)
             object_state[..., :3] += scene.env_origins.unsqueeze(1)
             rigid_object_collection.write_object_link_pose_to_sim(object_state[..., :7])
             rigid_object_collection.write_object_com_velocity_to_sim(object_state[..., 7:])

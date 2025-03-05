@@ -89,7 +89,7 @@ class SensorsSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.1, 1.0e5)
         ),
-        offset=CameraCfg.OffsetCfg(pos=(0.510, 0.0, 0.015), rot=(0.5, -0.5, 0.5, -0.5), convention="ros"),
+        offset=CameraCfg.OffsetCfg(pos=(0.4, 0.0, 0.9), rot=(0.5, -0.5, 0.5, -0.5), convention="ros"),
     )
     tiled_camera = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base/front_cam",

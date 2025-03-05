@@ -315,11 +315,9 @@ class DirectRLEnv(gym.Env):
 
         # process actions
         self._pre_physics_step(action)
-
         # check if we need to do rendering within the physics loop
         # note: checked here once to avoid multiple checks within the loop
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
-
         # perform physics stepping
         for _ in range(self.cfg.decimation):
             self._sim_step_counter += 1
@@ -336,7 +334,6 @@ class DirectRLEnv(gym.Env):
                 self.sim.render()
             # update buffers at sim dt
             self.scene.update(dt=self.physics_dt)
-
         # post-step:
         # -- update env counters (used for curriculum generation)
         self.episode_length_buf += 1  # step in current episode (per env)
@@ -344,11 +341,15 @@ class DirectRLEnv(gym.Env):
 
         self.reset_terminated[:], self.reset_time_outs[:] = self._get_dones()
         self.reset_buf = self.reset_terminated | self.reset_time_outs
+        # Print the reset buf when it contains true values only
+        if self.reset_buf.all():
+            print("Episode End, resetting envs")
         self.reward_buf = self._get_rewards()
 
         # -- reset envs that terminated/timed-out and log the episode information
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
+            print(f"Resetting envs: {reset_env_ids}")
             self._reset_idx(reset_env_ids)
             # update articulation kinematics
             self.scene.write_data_to_sim()
@@ -372,6 +373,41 @@ class DirectRLEnv(gym.Env):
 
         # return observations, rewards, resets and extras
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+    
+    ###
+    # Seb addition
+    ###
+
+    def step_physics_only(self, start_pose: torch.Tensor) -> None:
+        """
+        Steps through the physics simulation for the given start_pose without computing
+        rewards, observations, or handling resets.
+
+        Args:
+            start_pose: A tensor of shape (num_envs, action_dim) with the actions to apply.
+        """
+        # Move start_pose to device and optionally apply start_pose noise if configured.
+        start_pose = start_pose.to(self.device)
+        if self.cfg.action_noise_model:
+            start_pose = self._action_noise_model.apply(start_pose)
+
+        # Pre-process actions before physics stepping.
+        self._pre_physics_step_through(start_pose)
+        
+        # Check if rendering is enabled.
+        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+
+        # Loop over the decimation steps.
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            self._apply_action()
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+                self.sim.render()
+            self.scene.update(dt=self.physics_dt)
+
+
 
     @staticmethod
     def seed(seed: int = -1) -> int:
@@ -602,6 +638,17 @@ class DirectRLEnv(gym.Env):
         """
         raise NotImplementedError(f"Please implement the '_pre_physics_step' method for {self.__class__.__name__}.")
 
+    @abstractmethod
+    def _pre_physics_step_through(self, start_pose: torch.Tensor):
+        """Pre-process actions before stepping through the physics.
+
+        This function is called when you want to step through n number of steps to set the arm in a certain 
+        position. This is useful for setting the arm in a certain position before starting the episode.
+
+        Args:
+            actions: The actions to apply on the environment. Shape is (num_envs, action_dim).
+        """
+    
     @abstractmethod
     def _apply_action(self):
         """Apply actions to the simulator.

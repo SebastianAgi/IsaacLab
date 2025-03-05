@@ -26,6 +26,7 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--algorithm", type=str, default="PPO", help="The RL algorithm used for training the skrl agent.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -50,6 +51,7 @@ import random
 from datetime import datetime
 
 from stable_baselines3 import PPO
+from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.vec_env import VecNormalize
@@ -89,13 +91,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # directory for logging into
-    log_dir = os.path.join("logs", "sb3", args_cli.task, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    # log_dir = os.path.join("logs", "sb3", args_cli.task, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+
+
+    log_dir = os.path.join("logs")
+    if not os.path.isdir(log_dir):
+        os.mkdir(log_dir)
+    # In the container, the absolute path will be
+    # /workspace/isaaclab/logs/docker_tutorial, because
+    # all python execution is done through /workspace/isaaclab/isaaclab.sh
+    # and the calling process' path will be /workspace/isaaclab
+    log_dir = os.path.abspath(os.path.join(log_dir, "sb3", agent_cfg["name"],agent_cfg["algorithm"], datetime.now().strftime("%Y-%m-%d_%H-%M-%S")))
+    if not os.path.isdir(log_dir):
+        os.makedirs(log_dir)
+
+
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
+    name = agent_cfg.pop("name")
+    algorithm = agent_cfg.pop("algorithm")
     # post-process agent configuration
     agent_cfg = process_sb3_cfg(agent_cfg)
     # read configurations about the agent-training
@@ -136,7 +154,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
     # create agent from stable baselines
-    agent = PPO(policy_arch, env, verbose=1, **agent_cfg)
+    if algorithm == "sac":
+        agent = SAC(policy_arch, env, verbose=1, **agent_cfg)
+    elif algorithm == "ppo":
+        agent = PPO(policy_arch, env, verbose=1, **agent_cfg)
+    else:
+        raise ValueError(f"Policy architecture {args_cli.algorithm} not supported")
     # configure the logger
     new_logger = configure(log_dir, ["stdout", "tensorboard"])
     agent.set_logger(new_logger)
@@ -144,7 +167,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # callbacks for agent
     checkpoint_callback = CheckpointCallback(save_freq=1000, save_path=log_dir, name_prefix="model", verbose=2)
     # train the agent
-    agent.learn(total_timesteps=n_timesteps, callback=checkpoint_callback)
+    agent.learn(total_timesteps=n_timesteps, callback=checkpoint_callback, progress_bar=True)
     # save the final model
     agent.save(os.path.join(log_dir, "model"))
 

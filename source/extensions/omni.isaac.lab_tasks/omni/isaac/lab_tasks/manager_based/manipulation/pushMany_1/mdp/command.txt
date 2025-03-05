@@ -1,0 +1,3 @@
+./isaaclab.sh -p source/standalone/workflows/rsl_rl/train.py --task Isaac-Push-ManyCube-Franka-v1 --num_envs 4096 --headless
+
+./isaaclab.sh -p source/standalone/workflows/rsl_rl/play.py --task Isaac-Push-ManyCube-Franka-v1 --num_envs 3 --checkpoint /home/sebastian/IsaacLab/logs/rsl_rl/franka_push_many_1/****-**-**_**-**-**/checkpoints/best_agent.pt

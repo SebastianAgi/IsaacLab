@@ -12,7 +12,7 @@ PhysX. This helps perform parallelized computation of the inverse kinematics.
 .. code-block:: bash
 
     # Usage
-    ./isaaclab.sh -p source/standalone/tutorials/05_controllers/ik_control.py
+    ./isaaclab.sh -p source/standalone/tutorials/05_controllers/run_diff_ik.py
 
 """
 
@@ -109,7 +109,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     ee_goals = [
         [0.5, 0.5, 0.7, 0.707, 0, 0.707, 0],
         [0.5, -0.4, 0.6, 0.707, 0.707, 0.0, 0.0],
-        [0.5, 0, 0.5, 0.0, 1.0, 0.0, 0.0],
+        [-0.5, 0, 0.5, 0.0, 1.0, 0.0, 0.0],
     ]
     ee_goals = torch.tensor(ee_goals, device=sim.device)
     # Track the given command
@@ -125,6 +125,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         robot_entity_cfg = SceneEntityCfg("robot", joint_names=[".*"], body_names=["ee_link"])
     else:
         raise ValueError(f"Robot {args_cli.robot} is not supported. Valid: franka_panda, ur10")
+    
+    print('###################')
+    print('robot_entity_cfg: ',robot_entity_cfg)
+
     # Resolving the scene entities
     robot_entity_cfg.resolve(scene)
     # Obtain the frame index of the end-effector
@@ -132,8 +136,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # the root body is not included in the returned Jacobians.
     if robot.is_fixed_base:
         ee_jacobi_idx = robot_entity_cfg.body_ids[0] - 1
+        print('fixed base')
     else:
         ee_jacobi_idx = robot_entity_cfg.body_ids[0]
+        print('not fixed base')
+
+    print('###################')
+    print(robot_entity_cfg.joint_ids)
+    print('###################')
 
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
@@ -141,7 +151,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Simulation loop
     while simulation_app.is_running():
         # reset
-        if count % 150 == 0:
+        if count % 1500 == 0:
+            print('yeet this resets often')
             # reset time
             count = 0
             # reset joint state
@@ -158,6 +169,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             # change goal
             current_goal_idx = (current_goal_idx + 1) % len(ee_goals)
         else:
+            if count % 300 == 0:
+                print('yeet this resets sometimes')
+                ik_commands[:] = ee_goals[current_goal_idx]
+                diff_ik_controller.set_command(ik_commands[0:2])
+                # change goal
+                current_goal_idx = (current_goal_idx + 1) % len(ee_goals)
             # obtain quantities from simulation
             jacobian = robot.root_physx_view.get_jacobians()[:, ee_jacobi_idx, :, robot_entity_cfg.joint_ids]
             ee_pose_w = robot.data.body_state_w[:, robot_entity_cfg.body_ids[0], 0:7]
@@ -177,6 +194,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         sim.step()
         # update sim-time
         count += 1
+        print(count)
         # update buffers
         scene.update(sim_dt)
 

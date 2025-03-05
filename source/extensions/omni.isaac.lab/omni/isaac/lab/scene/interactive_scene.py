@@ -235,7 +235,7 @@ class InteractiveScene:
 
     """
     Properties.
-    """
+    """ 
 
     @property
     def physics_scene_path(self) -> str:

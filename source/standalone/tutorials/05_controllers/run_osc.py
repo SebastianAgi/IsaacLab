@@ -81,7 +81,7 @@ class SceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.CuboidCfg(
             size=(2.0, 1.5, 0.01),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0), opacity=0.1),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0), opacity=0.5),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             activate_contact_sensors=True,
         ),

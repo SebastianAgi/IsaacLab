@@ -1,0 +1,29 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Run IsaacLab RL Game",
+        "type": "shell",
+        "command": "/home/sebastian/IsaacLab/isaaclab.sh",
+        "args": [
+          "-p",
+          "standalone/workflows/rl_games/train.py",
+          "--task=Isaac-Franka-Granular-Spawn-Close-v0",
+          "--num_envs=16",
+          "--headless"
+        ],
+        "group": {
+          "kind": "build",
+          "isDefault": true
+        },
+        "presentation": {
+          "echo": true,
+          "reveal": "always",
+          "focus": false,
+          "panel": "shared"
+        },
+        "problemMatcher": []
+      }
+    ]
+  }
+  
