@@ -23,7 +23,7 @@ from omni.isaac.lab.utils.math import quat_mul, sample_uniform, subtract_frame_t
 from .franka_gran_cfg import FrankaGranCfg
 
 
-class FrankaGranSpawnClose(DirectRLEnv):
+class FrankaGranSpawnClose3DOF(DirectRLEnv):
     """RL Environment where the action space is the end-effector pose (position + orientation)."""
 
     # pre-physics step calls
@@ -55,6 +55,15 @@ class FrankaGranSpawnClose(DirectRLEnv):
             torch.zeros_like(delta_theta),
             torch.sin(delta_theta / 2)
         ], dim=-1)
+    
+    @torch.jit.script
+    def yaw_to_quaternion(yaw, num_envs: int):
+        """Convert a yaw angle (rotation around the z-axis in radians) to a quaternion."""
+        quat = torch.zeros((num_envs, 4), dtype=torch.float, device=yaw.device)
+        quat[:, 0] = torch.cos(yaw / 2)
+        quat[:, 3] = torch.sin(yaw / 2)
+
+        return quat
 
     @torch.jit.script
     def get_spawn_points_hemisphere_batch(
@@ -173,7 +182,7 @@ class FrankaGranSpawnClose(DirectRLEnv):
         self.objects_pos = torch.zeros((self.num_envs, self.cfg.num_grans, 3), dtype=torch.float, device=self.device)
         self.objects_pos[:,:,:] = self.get_spawn_points_hemisphere_batch(
             centers=self.init_spawn_point.repeat(self.num_envs, 1), 
-            spawn_area_radius=0.1, 
+            spawn_area_radius=cfg.spawn_area_radius, 
             sphere_radius=(self.cfg.object_scale*math.sqrt(3))/2, 
             n=self.cfg.num_grans
         )
@@ -219,6 +228,10 @@ class FrankaGranSpawnClose(DirectRLEnv):
         self.reset_actions = torch.zeros((self.num_envs, 7), device=self.device)
         # variable for increasing the value when object within the target area
         self.within_area = torch.tensor(0.0, dtype=torch.float, device=self.device)
+        # Quaternion for 90 degree rotation around x-axis
+        self.rot_90_x = torch.tensor([0.7071, 0, 0, 0.7071], device=self.device).repeat(self.num_envs, 1)
+        # Quaternion for 180 degree rotation around x-axis
+        self.rot_180_x = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
 
         ##
 
@@ -341,38 +354,37 @@ class FrankaGranSpawnClose(DirectRLEnv):
         self.ik_commands = torch.zeros(self.num_envs, self.diff_ik_controller.action_dim, device=self.device)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        # Actions are in the order [dx, dy, dz, yaw_rad]
+        # Actions are in the order [dx, dy, yaw_rad]
 
         # Clamp and scale the actions
         self.actions = actions.clone().clamp(-1.0, 1.0)
 
-        delta_position = self.actions[:, :3] * self.cfg.action_scale * self.dt
+        delta_position = self.actions[:, :2] * self.cfg.action_scale * self.dt
 
         # Update the end effector position and orientation
-        self.ee_position += delta_position
+        self.ee_position[:,:2] += delta_position[:,:2]
         self.ee_position[:, 0] = torch.clamp(self.ee_position[:, 0], 0.075, 0.725)
         self.ee_position[:, 1] = torch.clamp(self.ee_position[:, 1], -0.375, 0.375)
         # self.ee_position[:, 2] = torch.clamp(self.ee_position[:, 2], self.robot_local_grasp_pos[0, 2], 0.4) 
-        self.ee_position[:, 2] = self.robot_local_grasp_pos[:,2]  - 0.115
+        self.ee_position[:, 2] = self.robot_local_grasp_pos[:,2]  - 0.1165
 
         # Compute the new yaw angle
-        delta_yaw = self.actions[:, 3] * self.dt
-        current_yaw = self.quaternion_to_yaw(self.ee_orientation)
-
-        # Clamp the new yaw angle to the rotation limits
-        # clamped_yaw = torch.clamp(delta_yaw, 
-        #                           min = self.robot_dof_lower_limits[6] + 0.785398 - current_yaw, 
-        #                           max = self.robot_dof_upper_limits[6] + 0.785398 - current_yaw)
+        delta_yaw = self.actions[:, 2] * self.dt
+        current_yaw = self.quaternion_to_yaw(self.robot_grasp_rot)
         
-        clamped_yaw = torch.where(((delta_yaw + current_yaw > self.robot_dof_lower_limits[6]) |
-                                   (delta_yaw + current_yaw < self.robot_dof_upper_limits[6])),
-                                   delta_yaw,
-                                   0.0)
+        clamped_yaw = torch.where((
+            (delta_yaw + current_yaw > self.robot_dof_lower_limits[6]) 
+            |                      # or
+            (delta_yaw + current_yaw < self.robot_dof_upper_limits[6])),
+            delta_yaw,
+            0.0)
 
         # Convert the clamped yaw angle to a quaternion
-        clamped_yaw_quat = torch.zeros((self.num_envs, 4), device=self.device)
-        clamped_yaw_quat[:, 0] = torch.cos(clamped_yaw / 2)
-        clamped_yaw_quat[:, 3] = torch.sin(clamped_yaw / 2)
+        clamped_yaw_quat = self.yaw_to_quaternion(clamped_yaw, self.num_envs)
+        # convert the current yaw to quaternion
+        self.ee_orientation = self.yaw_to_quaternion(current_yaw, self.num_envs)
+
+        self.ee_orientation = quat_mul(self.ee_orientation, self.rot_180_x)
 
         # Update the end effector orientation
         self.ee_orientation = quat_mul(self.ee_orientation, clamped_yaw_quat)
@@ -396,7 +408,7 @@ class FrankaGranSpawnClose(DirectRLEnv):
         self.mean_marker.visualize(self.objects_pos_mean, self.all_env_unit_quat)
 
     def _pre_physics_step_through(self, start_pose: torch.Tensor):
-        # Actions are in the order [dx, dy, dz, yaw_rad]
+        # Actions are in the order [dx, dy, yaw_rad]
 
         # Set the updated pose as the IK command
         self.ik_commands = torch.cat((start_pose[:,0:3], start_pose[:,3:7]), dim=-1)
@@ -410,6 +422,9 @@ class FrankaGranSpawnClose(DirectRLEnv):
             orientations=self.ik_commands[:,3:7], 
             scales= self.scale_tensor,
             marker_indices=None)
+        
+        # # Make sure no particle is outside the spawn area
+        # self.objects_state[:, :, 0] = 
 
     def _apply_action(self):
         """Apply actions to the simulator."""
@@ -442,8 +457,8 @@ class FrankaGranSpawnClose(DirectRLEnv):
 
         # Done if timeout occurs
         terminated = (self.objects_pos[:,:, 2] < 0.5).any(dim=1)
-        terminated2 = (torch.norm(self.objects_pos_mean, p=2,dim=-1) < 0.1).any()
-        terminated = terminated | terminated2
+        # terminated2 = (torch.norm(self.objects_pos_mean, p=2,dim=-1) < 0.1).any()
+        # terminated = terminated | terminated2
         # terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         timeouts = self.episode_length_buf >= self.max_episode_length -1
         
@@ -500,6 +515,8 @@ class FrankaGranSpawnClose(DirectRLEnv):
         # reset goal position
         rand_factor = torch.rand(len(env_ids), 3, device=self.device)
         self.target_pos[env_ids] = self.target_area[0] + rand_factor * (self.target_area[1] - self.target_area[0])
+        self.target_pos[env_ids,1] = self.cfg.target_pose[1] # keep y position constant
+        self.target_pos[env_ids,0] = torch.clamp(self.target_pos[env_ids,0],0.3,0.5)
         self.target_pos[env_ids,1] *= self.swap_goal.squeeze(1)[env_ids]
         self.target_pos[env_ids] = self.target_pos[env_ids] + self.scene.env_origins[env_ids]
 
@@ -511,6 +528,8 @@ class FrankaGranSpawnClose(DirectRLEnv):
         objects_new_state = self.default_objects_state#[env_ids]# shape (num_envs, num_grans, 13)
         rand_factor = torch.rand(len(env_ids), 3, device=self.device)
         new_spawn_points = self.spawn_area[0] + rand_factor * (self.spawn_area[1] - self.spawn_area[0])
+        new_spawn_points[:,1] = self.cfg.spawn_area_radius # keep y position constant
+        new_spawn_points[:,0] = self.target_pos[env_ids,0]
         objects_new_state[env_ids,:,:3] = self.get_spawn_points_hemisphere_batch(
             spawn_area_radius=self.cfg.spawn_area_radius, 
             centers=new_spawn_points, 
@@ -537,9 +556,11 @@ class FrankaGranSpawnClose(DirectRLEnv):
         pos, q_new = self._compute_spawn_point(env_ids)
 
         # self.reset_actions[env_ids,:3] = self.objects_pos_mean[env_ids] - self.scene.env_origins[env_ids] # - self.cfg.spawn_area_radius
-        self.reset_actions[env_ids,:3] = pos
-        self.reset_actions[env_ids,2] = self.robot_local_grasp_pos[env_ids,2]  - 0.125
+        self.reset_actions[env_ids,:2] = pos[:,:2]
+        self.reset_actions[env_ids,2] = self.robot_local_grasp_pos[env_ids,2]  - 0.1165
         self.reset_actions[env_ids,3:7] = q_new
+
+        self.init_ee_orientation[env_ids] = q_new
 
         for _ in range(settle_steps):
             DirectRLEnv.step_physics_only(self, self.reset_actions)
@@ -581,18 +602,29 @@ class FrankaGranSpawnClose(DirectRLEnv):
             3. Each object position 
             4. Target position
         """
+        # Delete the z axis of the end-effector position
+        robot_grasp_pos_temp = self.robot_grasp_pos[:,:2]
+
         # Convert the end-effector orientation to only the yaw angle
         ee_yaw = self.quaternion_to_yaw(self.ee_orientation)
         
-        # Reshape self.objects_pos, each_object_to_target_dists, and pusher_to_each_object_dists to 2D arrays
-        objects_pos_reshaped = self.objects_pos.reshape(self.num_envs, -1)  # Shape: [num_envs, num_grans * 3]
+        # # Reshape self.objects_pos, each_object_to_target_dists, and pusher_to_each_object_dists to 2D arrays
+        # objects_pos_reshaped = self.objects_pos.reshape(self.num_envs, -1)  # Shape: [num_envs, num_grans * 3]
+        
+        # Delete the z axis of the objects position
+        objects_pos_temp = self.objects_pos[:,:,:2]
+        objects_pos_reshaped = objects_pos_temp.reshape(self.num_envs, -1)
+
+        # Delete the z axis of the target position
+        target_pos_temp = self.target_pos[:,:2]
+        
 
         observations = torch.cat(
             (
-                self.robot_grasp_pos,      # [x, y, z]                     in world frame
+                robot_grasp_pos_temp,      # [x, y]                        in world frame
                 ee_yaw.unsqueeze(1),       # [yaw_rad]                     in world frame
-                objects_pos_reshaped,      # [x, y, z] x env objects       in world frame
-                self.target_pos,           # [x, y, z]                     in world frame 
+                objects_pos_reshaped,      # [x, y] x env objects          in world frame
+                target_pos_temp,           # [x, y]                        in world frame 
             ),  
             dim=-1,
         )
@@ -624,6 +656,8 @@ class FrankaGranSpawnClose(DirectRLEnv):
             self.robot_local_grasp_rot[env_ids],
             self.robot_local_grasp_pos[env_ids],
         )
+
+        print(f"robot_grasp_rot: {self.quaternion_to_yaw(self.robot_grasp_rot)}")
 
     def _compute_rewards(
         self,

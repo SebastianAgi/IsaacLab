@@ -219,6 +219,8 @@ class FrankaGranSpawnClose2(DirectRLEnv):
         self.reset_actions = torch.zeros((self.num_envs, 7), device=self.device)
         # variable for increasing the value when object within the target area
         self.within_area = torch.tensor(0.0, dtype=torch.float, device=self.device)
+        # Variable flag to either use real step or just direct action step
+        self.direct_action = torch.tensor(0, dtype=torch.bool, device=self.device)
 
         ##
 
@@ -524,28 +526,40 @@ class FrankaGranSpawnClose2(DirectRLEnv):
 
         # self.reset_actions[env_ids,:3] = self.objects_pos_mean[env_ids] - self.scene.env_origins[env_ids] # - self.cfg.spawn_area_radius
         self.reset_actions[env_ids,:3] = pos
-        self.reset_actions[env_ids,2] = self.robot_local_grasp_pos[env_ids,2]  - 0.125
+        self.reset_actions[env_ids,2] = self.robot_local_grasp_pos[env_ids,2]  - 0.12
         self.reset_actions[env_ids,3:7] = q_new
 
         for _ in range(settle_steps):
             DirectRLEnv.step_physics_only(self, self.reset_actions)
 
-        self.reset_actions[env_ids,:3] = self.target_pos[env_ids] - self.scene.env_origins[env_ids]
-
-        for _ in range(settle_steps):
-            DirectRLEnv.step(self, self.reset_actions)
 
         print("[INFO]: Done stepping through the physics engine")
 
         ##############################################################################################
         ##############################################################################################
 
-        # Refresh intermediate values for observations and rewards
-        self._compute_intermediate_values(env_ids)
         # span distance between objects and target
         self.spawn_distance[env_ids] = torch.norm(self.target_pos.unsqueeze(1)[env_ids] - self.objects_pos[env_ids], dim=-1)
 
+        # Stepping through first sweep with direct action
+        #################################################
+        self.reset_actions[env_ids,:3] = self.target_pos[env_ids] - self.scene.env_origins[env_ids]
+        self.reset_actions[env_ids,2] = self.robot_local_grasp_pos[env_ids,2]  - 0.12
+        self.reset_actions[env_ids,0] = torch.clamp(self.reset_actions[env_ids,0], 0.075, 0.725)
+        self.reset_actions[env_ids,1] = torch.clamp(self.reset_actions[env_ids,1], -0.375, 0.375)
+        
+        self.direct_action = True
+
+        for _ in range(120):
+            DirectRLEnv.step(self, self.reset_actions)
+
+        self.direct_action = False
+        #################################################
+
+        # Refresh intermediate values for observations and rewards
+        self._compute_intermediate_values(env_ids)
         self.swap_goal *= -1
+
 
     def _compute_spawn_point(self, env_ids: torch.Tensor) -> torch.Tensor:
         # Compute the vector from the target to the object mean.
@@ -553,7 +567,7 @@ class FrankaGranSpawnClose2(DirectRLEnv):
         # Normalize v to obtain a unit vector.
         v_hat = v / torch.norm(v, p=2, dim=-1, keepdim=True)
         # Compute the desired point on the spawn volume's edge.
-        pos = self.objects_pos_mean[env_ids] - self.scene.env_origins[env_ids] + (1.1*self.cfg.spawn_area_radius) * v_hat
+        pos = self.objects_pos_mean[env_ids] - self.scene.env_origins[env_ids] + (1.5*self.cfg.spawn_area_radius) * v_hat
 
         # calcuate start quaternion to point away from the target
         theta_desired = torch.arctan2(v_hat[:,1], v_hat[:,0])
@@ -653,12 +667,12 @@ class FrankaGranSpawnClose2(DirectRLEnv):
             f'---'
         )
 
-        if "log" not in self.extras:
-            self.extras["log"] = dict()
-        self.extras["log"]["target_reward"] = norm_reward.mean()
+        # if "log" not in self.extras:
+        #     self.extras["log"] = dict()
+        # self.extras["log"]["target_reward"] = norm_reward.mean()
         
-        wandb.log(self.extras["log"], step=self.global_step)
-        self.global_step += 1
+        # wandb.log(self.extras["log"], step=self.global_step)
+        # self.global_step += 1
 
         return rewards
 

@@ -170,18 +170,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset the agent and env
     runner.reset()
 
-    exit()
-
     # Add wandb support
     if args_cli.track:
         import wandb
         wandb.init(
-            project=args_cli.wandb_project_name,
+            project=args_cli.task,
             entity=args_cli.wandb_entity,
-            sync_tensorboard=False,
+            sync_tensorboard=True,
             config=agent_cfg,
             monitor_gym=True,
             save_code=True,
+            name=str(env_cfg.scene.num_envs) + "Envs-" + str(env_cfg.num_grans) + "Grans",
         )
 
 

@@ -22,14 +22,18 @@ import omni.isaac.lab.sim as sim_utils
 @configclass
 class FrankaGranCfg(DirectRLEnvCfg):
     # Number of Granules
-    num_grans = 100
+    num_grans = 10
 
     # Environment configuration
-    episode_length_s = 8.3333# 480 timesteps    timesteps = episode_length_s / (decimation * dt)
+    episode_length_s = 12# 480 timesteps    timesteps = episode_length_s / (decimation * dt)
     decimation = 2
-    action_space = 4
+    action_space = 3
     state_space = 0
-    observation_space = 7 + (3*num_grans)
+    # # Observation space for 3D environment
+    # observation_space = 7 + (3*num_grans)
+    # Observation space for 2D environment
+    observation_space = 5 + (2*num_grans)
+
 
     # Simulation configuration
     sim: SimulationCfg = SimulationCfg(
@@ -58,24 +62,25 @@ class FrankaGranCfg(DirectRLEnvCfg):
     # observation_space = 7 + (3*num_grans) #23 #34
 
     # goal circle radius
-    goal_diameter = 0.2
+    goal_diameter = 0.1
+    goal_radius = goal_diameter / 2
+    spawn_area_radius = 0.05
 
     # Spawn area configuration
     spawn_pose = [0.25, 0.19, 1.07]
     full_spawn_area = [[0.075, 0.0, 1.05], [0.725, 0.375, 1.05]] # smallest corner and largest corner
 
     # Target area configuration
-    target_pose = [0.375, -0.19, 1.07]
+    target_pose = [0.375, -goal_radius, 1.07]
     target_area = [[0.075, 0.0, 1.04], [0.725, -0.375, 1.04]] # smallest corner and largest corner
 
     # Create common spawn point for granules objects
-    init_spawn_point = [0.375, 0.19, 1.07]
+    init_spawn_point = [0.375, goal_radius, 1.07]
 
-    action_scale = 7.5
+    action_scale = 1.0 #7.5
     dof_velocity_scale = 0.1
 
     object_scale = 0.01
-    spawn_area_radius = 0.1
 
     # Reward scales
     dist_reward_scale = 5.0
@@ -85,17 +90,17 @@ class FrankaGranCfg(DirectRLEnvCfg):
 
     # Valid spawn area
     valid_spawn_area = [list(full_spawn_area[0]), list(full_spawn_area[1])]
-    valid_spawn_area[0][0] += spawn_area_radius
-    valid_spawn_area[0][1] += spawn_area_radius
-    valid_spawn_area[1][0] -= spawn_area_radius
-    valid_spawn_area[1][1] -= spawn_area_radius
+    valid_spawn_area[0][0] += goal_radius
+    valid_spawn_area[0][1] += goal_radius
+    valid_spawn_area[1][0] -= goal_radius
+    valid_spawn_area[1][1] -= goal_radius
 
     # Valid target area
     valid_target_area = [list(target_area[0]), list(target_area[1])]
-    valid_target_area[0][0] += spawn_area_radius
-    valid_target_area[0][1] -= spawn_area_radius
-    valid_target_area[1][0] -= spawn_area_radius
-    valid_target_area[1][1] += spawn_area_radius
+    valid_target_area[0][0] += goal_radius
+    valid_target_area[0][1] -= goal_radius
+    valid_target_area[1][0] -= goal_radius
+    valid_target_area[1][1] += goal_radius
 
 
 
@@ -182,7 +187,7 @@ class FrankaGranCfg(DirectRLEnvCfg):
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     solver_position_iteration_count=4, solver_velocity_iteration_count=0
                 ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                mass_props=sim_utils.MassPropertiesCfg(mass=0.0025, density=500.0),
                 collision_props=sim_utils.CollisionPropertiesCfg(),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(pos=init_spawn_point, rot=(1.0, 0.0, 0.0, 0.0)),

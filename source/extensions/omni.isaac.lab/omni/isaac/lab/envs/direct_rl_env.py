@@ -313,6 +313,12 @@ class DirectRLEnv(gym.Env):
         if self.cfg.action_noise_model:
             action = self._action_noise_model.apply(action)
 
+        # # process actions
+        # if self.direct_action:
+        #     self._pre_physics_step_through(action)
+        # else:
+        #     self._pre_physics_step(action)
+
         # process actions
         self._pre_physics_step(action)
         # check if we need to do rendering within the physics loop
