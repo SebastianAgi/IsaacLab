@@ -22,6 +22,8 @@ from omni.isaac.lab.managers import SceneEntityCfg
 from omni.isaac.lab.utils.math import quat_mul, sample_uniform, subtract_frame_transforms, axis_angle_from_quat, quat_inv, yaw_quat
 from .franka_gran_cfg import FrankaGranCfg
 
+from pytictac import Timer
+
 
 class FrankaGranSpawnClose3DOF(DirectRLEnv):
     """RL Environment where the action space is the end-effector pose (position + orientation)."""
@@ -159,6 +161,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
     cfg: FrankaGranCfg
     
     def __init__(self, cfg: FrankaGranCfg, render_mode: str | None = None, **kwargs):
+        # with Timer("__init__", verbose=True):
         super().__init__(cfg, render_mode, **kwargs)
 
         def get_env_local_pose(env_pos: torch.Tensor, xformable: UsdGeom.Xformable, device: torch.device):
@@ -218,6 +221,8 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         self.unit_vel = torch.zeros(6, dtype=torch.float, device=self.device)
         # Zero tensor
         self.zero_tensor = torch.tensor(0.0, device=self.device)
+        # 1 tensor
+        self.one_tensor = torch.tensor(1.0, device=self.device)
         # 0.1 tensor
         self.point1_tensor = torch.tensor(0.1, device=self.device)
         # wandb counter
@@ -226,14 +231,14 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         self.default_objects_state = torch.zeros((self.num_envs, self.cfg.num_grans, 13), dtype=torch.float, device=self.device)
         # Reset rollout actions
         self.reset_actions = torch.zeros((self.num_envs, 7), device=self.device)
-        # variable for increasing the value when object within the target area
-        self.within_area = torch.tensor(0.0, dtype=torch.float, device=self.device)
         # Quaternion for 90 degree rotation around x-axis
         self.rot_90_x = torch.tensor([0.7071, 0, 0, 0.7071], device=self.device).repeat(self.num_envs, 1)
         # Quaternion for 180 degree rotation around x-axis
         self.rot_180_x = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
 
-        ##
+        # terms to make reward only for when the objects move
+        self.prev_objects_pos = torch.zeros((self.num_envs, self.cfg.num_grans, 3), dtype=torch.float, device=self.device)
+        self.min_movement_threshold = torch.tensor(0.0001, device=self.device)  # Minimum distance to consider as movement
 
         # Set up grasp and push targets for pushing obstacles
         stage = get_current_stage()
@@ -259,7 +264,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         hand_pose_inv_rot, hand_pose_inv_pos = tf_inverse(hand_pose[3:7], hand_pose[0:3])
 
         robot_local_grasp_pose_rot, robot_local_grasp_pose_pos = tf_combine(
-             hand_pose_inv_rot, hand_pose_inv_pos, pusher_pose[3:7], pusher_pose[0:3]
+            hand_pose_inv_rot, hand_pose_inv_pos, pusher_pose[3:7], pusher_pose[0:3]
         )
         robot_local_grasp_pose_pos += torch.tensor([0, 0.04, 0], device=self.device)
         self.robot_local_grasp_pos = robot_local_grasp_pose_pos.repeat((self.num_envs, 1))
@@ -278,11 +283,11 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
 
         # Do not let objects exceed the total spawn area of cfg.full_spawn_area
         self.objects_state[:, :, 0] = torch.clamp(self.objects_state[:, :, 0], 
-                                                  (self.scene.env_origins[:, 0] + self.spawn_area[0][0]).unsqueeze(1), 
-                                                  (self.scene.env_origins[:, 0] + self.spawn_area[1][0]).unsqueeze(1))  
+                                                (self.scene.env_origins[:, 0] + self.spawn_area[0][0]).unsqueeze(1), 
+                                                (self.scene.env_origins[:, 0] + self.spawn_area[1][0]).unsqueeze(1))  
         self.objects_state[:, :, 1] = torch.clamp(self.objects_state[:, :, 1], 
-                                                  (self.scene.env_origins[:, 1] + self.spawn_area[0][1]).unsqueeze(1), 
-                                                  (self.scene.env_origins[:, 1] + self.spawn_area[1][1]).unsqueeze(1))
+                                                (self.scene.env_origins[:, 1] + self.spawn_area[0][1]).unsqueeze(1), 
+                                                (self.scene.env_origins[:, 1] + self.spawn_area[1][1]).unsqueeze(1))
 
         self.scale_tensor = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
         self.scale_tensor[:,:] = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float, device=self.device)
@@ -327,6 +332,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
 
 
     def _setup_scene(self):
+        # with Timer("_setup_scene", verbose=True):
         """Set up the scene, including loading the Franka arm and other relevant objects."""
         self._robot = Articulation(self.cfg.robot_high_pd) # GRAVITY DISABLED - diff_ik only works with gravity disabled
         self._table = RigidObject(self.cfg.table_cfg)
@@ -356,6 +362,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         # Actions are in the order [dx, dy, yaw_rad]
 
+        # with Timer("_pre_physics_step", verbose=True):
         # Clamp and scale the actions
         self.actions = actions.clone().clamp(-1.0, 1.0)
 
@@ -410,6 +417,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
     def _pre_physics_step_through(self, start_pose: torch.Tensor):
         # Actions are in the order [dx, dy, yaw_rad]
 
+        # with Timer("_pre_physics_step_through", verbose=True):
         # Set the updated pose as the IK command
         self.ik_commands = torch.cat((start_pose[:,0:3], start_pose[:,3:7]), dim=-1)
         # Set the IK command for the differential IK controller
@@ -427,6 +435,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         # self.objects_state[:, :, 0] = 
 
     def _apply_action(self):
+        # with Timer("_apply_action", verbose=True):
         """Apply actions to the simulator."""
         # Obtain quantities from simulation
         jacobian = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
@@ -451,6 +460,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         self.ee_marker.visualize(ee_pos, ee_quat)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # with Timer("_get_dones", verbose=True):
         """Determine if environments are done."""
 
         self._compute_intermediate_values()
@@ -465,8 +475,9 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         return terminated, timeouts
 
     def _get_rewards(self) -> torch.Tensor:
+        # with Timer("_get_rewards", verbose=True):
         """Compute and return rewards for each environment."""
-         # Refresh the intermediate values after the physics step
+        # Refresh the intermediate values after the physics step
         self._compute_intermediate_values()
 
         return self._compute_rewards(
@@ -482,6 +493,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         )
     
     def _reset_idx(self, env_ids: torch.Tensor | None):
+        # with Timer("_reset_idx", verbose=True):
         if env_ids is None:
             env_ids = self._robot._ALL_INDICES
         super()._reset_idx(env_ids)
@@ -529,7 +541,7 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         rand_factor = torch.rand(len(env_ids), 3, device=self.device)
         new_spawn_points = self.spawn_area[0] + rand_factor * (self.spawn_area[1] - self.spawn_area[0])
         new_spawn_points[:,1] = self.cfg.spawn_area_radius # keep y position constant
-        new_spawn_points[:,0] = self.target_pos[env_ids,0]
+        new_spawn_points[:,0] = self.target_pos[env_ids,0] - self.scene.env_origins[env_ids,0]
         objects_new_state[env_ids,:,:3] = self.get_spawn_points_hemisphere_batch(
             spawn_area_radius=self.cfg.spawn_area_radius, 
             centers=new_spawn_points, 
@@ -602,6 +614,8 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
             3. Each object position 
             4. Target position
         """
+
+        # with Timer("_get_observations", verbose=True):
         # Delete the z axis of the end-effector position
         robot_grasp_pos_temp = self.robot_grasp_pos[:,:2]
 
@@ -657,8 +671,6 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
             self.robot_local_grasp_pos[env_ids],
         )
 
-        print(f"robot_grasp_rot: {self.quaternion_to_yaw(self.robot_grasp_rot)}")
-
     def _compute_rewards(
         self,
         objects_pos,
@@ -671,31 +683,35 @@ class FrankaGranSpawnClose3DOF(DirectRLEnv):
         target_reward_scale,
         action_penalty_scale,
     ):
+        ## Calculate object movement from previous positions
+        object_movement = torch.norm(objects_pos - self.prev_objects_pos, p=2, dim=-1)  # shape (num_envs, num_grans)
+        is_moving = object_movement > self.min_movement_threshold
+        
         ## Distance from objects to target reward
-        goal_dist = torch.norm(objects_pos - target_pos.unsqueeze(1), p=2, dim=-1) # shape (num_envs, num_grans)
-
-        #Make anywhere in the target area optimal
-        goal_dist = torch.where(goal_dist < self.cfg.goal_diameter/2, self.within_area, goal_dist)
+        goal_dist = torch.norm(objects_pos - target_pos.unsqueeze(1), p=2, dim=-1)  # shape (num_envs, num_grans)
         
-        norm_goal_dist = 1 - torch.div(goal_dist, spawn_distance) 
-
-        norm_goal_dist = torch.where(norm_goal_dist < 0, self.within_area, norm_goal_dist)
-
-        norm_goal_dist_sum = torch.sum(norm_goal_dist, dim=-1)        
-
-        norm_reward = norm_goal_dist_sum/ self.cfg.num_grans
+        # Make anywhere in the target area optimal
+        goal_dist = torch.where(goal_dist < self.cfg.goal_diameter/2, self.zero_tensor, goal_dist)
         
+        norm_goal_dist = 1 - torch.div(goal_dist, spawn_distance)
+        norm_goal_dist = torch.where(norm_goal_dist < 0.0, self.zero_tensor, norm_goal_dist)
+        
+        # Only give rewards for objects that are actually moving or already in target area
+        in_target = goal_dist == self.zero_tensor
+        norm_goal_dist = torch.where(is_moving, norm_goal_dist, 0.0)
+        norm_goal_dist_sum = torch.sum(norm_goal_dist, dim=-1)
+        norm_reward = norm_goal_dist_sum / self.cfg.num_grans
+        
+        # Save current positions for next step
+        self.prev_objects_pos = objects_pos.clone()
 
-        # Total reward
-        rewards = (norm_reward
-            #  target_reward_scale * norm_goal_dist_sum
-        )
-        # print(
-        #     f'reward target_dist_reward:        {norm_goal_dist_sum[0]} \n'
-        #     # f'reward total env 0:               {rewards[0]} \n'
-        #     # f'---'
-        # )
+        # Bonus for reaching the target area
+        target_reward = (~is_moving * in_target).sum(dim=-1) / self.cfg.num_grans
+        # Total reward      
+        rewards = norm_reward + target_reward
 
+        # print(f"rewards: {rewards[0]}")
+        
         return rewards
 
     def _compute_grasp_transforms(
