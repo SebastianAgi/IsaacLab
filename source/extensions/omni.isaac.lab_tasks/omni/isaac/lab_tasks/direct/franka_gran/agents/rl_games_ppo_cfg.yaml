@@ -64,7 +64,7 @@ params:
     save_best_after: 50
     save_frequency: 100
     grad_norm: 1.0
-    entropy_coef: 0.0
+    entropy_coef: 0.008
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 16
@@ -74,3 +74,6 @@ params:
     clip_value: True
     seq_length: 4
     bounds_loss_coef: 0.0001
+
+    # Seb additions
+    num_repeat_actions: 4

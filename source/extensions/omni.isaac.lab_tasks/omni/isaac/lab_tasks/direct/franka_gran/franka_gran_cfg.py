@@ -25,15 +25,21 @@ class FrankaGranCfg(DirectRLEnvCfg):
     num_grans = 10
 
     # Environment configuration
-    episode_length_s = 12# 480 timesteps    timesteps = episode_length_s / (decimation * dt)
+    episode_length_s = 16# 8=480, 12=720. 16=, 50=3000 timesteps    timesteps = episode_length_s / (decimation * dt)
     decimation = 2
     action_space = 3
     state_space = 0
     # # Observation space for 3D environment
     # observation_space = 7 + (3*num_grans)
-    # Observation space for 2D environment
-    observation_space = 5 + (2*num_grans)
+    # # Observation space for 2D 3DOF environment (target != origin)
+    # observation_space = 5 + (2*num_grans)
+    # Observation space for 2D environment 3DOF env (target = origin)
+    observation_space = 3 + (2*num_grans)
+    # Observation space for image based observation
+    # observation_space = 256*256
 
+    # Actions to repeat
+    num_repeat_actions = 4
 
     # Simulation configuration
     sim: SimulationCfg = SimulationCfg(
@@ -54,24 +60,17 @@ class FrankaGranCfg(DirectRLEnvCfg):
             gpu_found_lost_pairs_capacity=2**22,
         ),
     )
-    
-    # Robot configuration
-    robot_name = 'franka_panda' # 'franka_panda' or 'ur10' or 'widowx'
-
-    # Observation space
-    # observation_space = 7 + (3*num_grans) #23 #34
 
     # goal circle radius
     goal_diameter = 0.1
     goal_radius = goal_diameter / 2
     spawn_area_radius = 0.05
 
-    # Spawn area configuration
+    # Spawn/target area configuration
     spawn_pose = [0.25, 0.19, 1.07]
-    full_spawn_area = [[0.075, 0.0, 1.05], [0.725, 0.375, 1.05]] # smallest corner and largest corner
-
-    # Target area configuration
-    target_pose = [0.375, -goal_radius, 1.07]
+    target_pose = [0.5, -goal_radius, 1.07]
+    full_table = [[0.075, -0.375, 1.05], [0.725, 0.375, 1.05]]
+    spawn_area = [[0.075, 0.0, 1.05], [0.725, 0.375, 1.05]] # smallest corner and largest corner
     target_area = [[0.075, 0.0, 1.04], [0.725, -0.375, 1.04]] # smallest corner and largest corner
 
     # Create common spawn point for granules objects
@@ -79,17 +78,18 @@ class FrankaGranCfg(DirectRLEnvCfg):
 
     action_scale = 1.0 #7.5
     dof_velocity_scale = 0.1
-
     object_scale = 0.01
 
+
     # Reward scales
-    dist_reward_scale = 5.0
+    dist_reward_scale = 0.005
     action_penalty_scale = 0.05
+    direction_penalty_scale = 5.0
     target_reward_scale = 5.0
     alignment_reward_scale = 0.05
 
     # Valid spawn area
-    valid_spawn_area = [list(full_spawn_area[0]), list(full_spawn_area[1])]
+    valid_spawn_area = [list(spawn_area[0]), list(spawn_area[1])]
     valid_spawn_area[0][0] += goal_radius
     valid_spawn_area[0][1] += goal_radius
     valid_spawn_area[1][0] -= goal_radius
@@ -102,7 +102,8 @@ class FrankaGranCfg(DirectRLEnvCfg):
     valid_target_area[1][0] -= goal_radius
     valid_target_area[1][1] += goal_radius
 
-
+    # Robot configuration
+    robot_name = 'franka_panda' # 'franka_panda' or 'ur10' or 'widowx'
 
     # Scene configuration
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=3.0, replicate_physics=True)

@@ -88,6 +88,7 @@ class DirectRLEnv(gym.Env):
         # initialize internal variables
         self._is_closed = False
 
+
         # set the seed for the environment
         if self.cfg.seed is not None:
             self.cfg.seed = self.seed(self.cfg.seed)
@@ -196,6 +197,14 @@ class DirectRLEnv(gym.Env):
 
         # -- set the framerate of the gym video recorder wrapper so that the playback speed of the produced video matches the simulation
         self.metadata["render_fps"] = 1 / self.step_dt
+
+        #################
+        # Seb additions #
+        #################
+        self.action_repeat = 4
+        print('num_repeat_actions: ',self.cfg.num_repeat_actions)
+        self.current_action = torch.zeros(self.num_envs, self.action_space.shape[0], device=self.device)
+        #################
 
         # print the environment information
         print("[INFO]: Completed setting up the environment...")
@@ -308,7 +317,9 @@ class DirectRLEnv(gym.Env):
         Returns:
             A tuple containing the observations, rewards, resets (terminated and truncated) and extras.
         """
+
         action = action.to(self.device)
+        
         # add action noise
         if self.cfg.action_noise_model:
             action = self._action_noise_model.apply(action)
@@ -318,9 +329,12 @@ class DirectRLEnv(gym.Env):
         #     self._pre_physics_step_through(action)
         # else:
         #     self._pre_physics_step(action)
+        # for every 4th step, get new action
+        if self._sim_step_counter % self.cfg.num_repeat_actions == 0:
+            self.current_action = action
 
         # process actions
-        self._pre_physics_step(action)
+        self._pre_physics_step(self.current_action)
         # check if we need to do rendering within the physics loop
         # note: checked here once to avoid multiple checks within the loop
         is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
