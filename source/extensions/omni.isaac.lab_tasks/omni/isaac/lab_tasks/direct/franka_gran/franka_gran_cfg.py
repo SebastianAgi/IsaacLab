@@ -25,21 +25,21 @@ class FrankaGranCfg(DirectRLEnvCfg):
     num_grans = 10
 
     # Environment configuration
-    episode_length_s = 16# 8=480, 12=720. 16=, 50=3000 timesteps    timesteps = episode_length_s / (decimation * dt)
+    episode_length_s = 16# 8=480, 12=720. 16=960, 50=3000 timesteps    timesteps = episode_length_s / (decimation * dt)
     decimation = 2
     action_space = 3
     state_space = 0
     # # Observation space for 3D environment
     # observation_space = 7 + (3*num_grans)
+
     # # Observation space for 2D 3DOF environment (target != origin)
     # observation_space = 5 + (2*num_grans)
-    # Observation space for 2D environment 3DOF env (target = origin)
-    observation_space = 3 + (2*num_grans)
-    # Observation space for image based observation
-    # observation_space = 256*256
 
-    # Actions to repeat
-    num_repeat_actions = 4
+    # Observation space for 2D environment 3DOF env (target = origin)
+    # observation_space = 3 + (2*num_grans)
+
+    # Observation space for image based observation
+    observation_space = [3, 96, 96]
 
     # Simulation configuration
     sim: SimulationCfg = SimulationCfg(
@@ -104,6 +104,8 @@ class FrankaGranCfg(DirectRLEnvCfg):
 
     # Robot configuration
     robot_name = 'franka_panda' # 'franka_panda' or 'ur10' or 'widowx'
+
+    observation_dir = ""
 
     # Scene configuration
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=3.0, replicate_physics=True)

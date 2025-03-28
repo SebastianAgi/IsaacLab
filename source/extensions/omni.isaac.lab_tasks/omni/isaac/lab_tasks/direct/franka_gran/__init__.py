@@ -21,6 +21,7 @@ from .franka_gran_2D_3DOF_attract_targetorigin import FrankaGran2D3DOFAttractTar
 from .franka_gran_2D_3DOF_new_reset import FrankaGran2D3DOFNewReset
 from .franka_gran_2D_3DOF_reset_2 import FrankaGran2D3DOFReset2
 from .franka_gran_2D_3DOF_grid import FrankaGran2D3DOFGrid
+from .franka_gran_2D_3DOF_grid_no_reset import FrankaGran2D3DOFGridContinuing
 
 ##
 # Register Gym environments.
@@ -193,6 +194,62 @@ gym.register(
 )
 
 
+
+# Env config:
+#    - action space of 2D and 3DOF movement ony on x,y axis, 
+#    - Observations is a 128x128 matrix of the table
+# Rewards here: 
+#    - objects distance to target
+#    - Gripper attraction to objects
+gym.register(
+    id="Isaac-Franka-Granular-2D-3DOF-GRID-CNN-v0",
+    entry_point=f"{__name__}.franka_gran_2D_3DOF_grid:FrankaGran2D3DOFGrid",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.franka_gran_spawn_close:FrankaGranCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_cnn_ppo_cfg.yaml",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaPushObjectsPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
+
+
+# Env config:
+#    - action space of 2D and 3DOF movement ony on x,y axis, 
+#    - Observations is a 128x128 matrix of the table
+# Rewards here: 
+#    - objects distance to target
+#    - Gripper attraction to objects
+gym.register(
+    id="Isaac-Franka-Granular-2D-3DOF-GRID-Resnet-v0",
+    entry_point=f"{__name__}.franka_gran_2D_3DOF_grid:FrankaGran2D3DOFGrid",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.franka_gran_spawn_close:FrankaGranCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_resnet_ppo_cfg.yaml",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaPushObjectsPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
+
+
+# Env config:
+#    - action space of 2D and 3DOF movement ony on x,y axis, 
+#    - Observations is a 96x96 matrix of the table
+#    - PPO with Resnet architecture
+# Rewards here: 
+#    - objects in target area ONLY
+gym.register(
+    id="Isaac-Franka-Granular-2D-3DOF-GRID-Resnet-v1",
+    entry_point=f"{__name__}.franka_gran_2D_3DOF_grid_no_reset:FrankaGran2D3DOFGridContinuing",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.franka_gran_spawn_close:FrankaGranCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_resnet_ppo_cfg.yaml",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaPushObjectsPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
 
 
 # Env config for placing gripper close to objects and also doing an initial action forcing of pushing 

@@ -25,7 +25,7 @@ import math
 import os
 
 
-class FrankaGran2D3DOFGrid(DirectRLEnv):
+class FrankaGran2D3DOFGridContinuing(DirectRLEnv):
     """RL Environment where the action space is the end-effector pose (position + orientation)."""
 
     # pre-physics step calls
@@ -229,7 +229,6 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
         self.point1_tensor = torch.tensor(0.1, device=self.device)
         # wandb counter
         self.global_step = torch.tensor(0, device=self.device)
-        self.image_step = torch.tensor(0, device=self.device)
         # Default objects state shape (num_instances, num_objects, 13)
         self.default_objects_state = torch.zeros((self.num_envs, self.cfg.num_grans, 13), dtype=torch.float, device=self.device)
         # Reset rollout actions
@@ -345,10 +344,6 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
 
         self.observation_dir = cfg.observation_dir
         self.grid_save_path = os.path.join(self.observation_dir, "grid_observations")#
-
-        # # Reset the robot state
-        # self._robot.set_joint_position_target(self.start_joint_pos)
-        # self._robot.write_joint_state_to_sim(self.start_joint_pos, self.start_joint_vel)
 
     def _setup_scene(self):
         # with Timer("_setup_scene", verbose=True):
@@ -494,8 +489,7 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
         # terminated = terminated | terminated2
         # terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         timeouts = self.episode_length_buf >= self.max_episode_length -1
-
-
+        # timeouts = self.reset_goal_buf
 
         return terminated, timeouts
 
@@ -525,27 +519,27 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # Reset the robot state
-        self._robot.set_joint_position_target(self.start_joint_pos, env_ids=env_ids)
-        self._robot.write_joint_state_to_sim(self.start_joint_pos, self.start_joint_vel, env_ids=env_ids)
+        # self._robot.set_joint_position_target(self.start_joint_pos, env_ids=env_ids)
+        # self._robot.write_joint_state_to_sim(self.start_joint_pos, self.start_joint_vel, env_ids=env_ids)
 
-        # EE and arm root pose in world frame
-        ee_pose_w = self._robot.data.body_state_w[env_ids, self.robot_entity_cfg.body_ids[0], 0:7]
-        root_pose_w = self._robot.data.root_state_w[env_ids, 0:7]
-        # compute frame in root frame
-        ee_pos_b, ee_quat_b = subtract_frame_transforms(
-            root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
-        )
-        # End-effector pose in robot's local frame
-        ee_pose = torch.cat((ee_pos_b, ee_quat_b), dim=-1)
-        # Set the initial IK commands to be the current end-effector pose
-        self.ik_commands[env_ids] = ee_pose
-        self.diff_ik_controller.reset(env_ids=env_ids) # Reset the differential IK controller       
-        self.diff_ik_controller.set_command(self.ik_commands) # Set the initial IK commands
+        # # EE and arm root pose in world frame
+        # ee_pose_w = self._robot.data.body_state_w[env_ids, self.robot_entity_cfg.body_ids[0], 0:7]
+        # root_pose_w = self._robot.data.root_state_w[env_ids, 0:7]
+        # # compute frame in root frame
+        # ee_pos_b, ee_quat_b = subtract_frame_transforms(
+        #     root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
+        # )
+        # # End-effector pose in robot's local frame
+        # ee_pose = torch.cat((ee_pos_b, ee_quat_b), dim=-1)
+        # # Set the initial IK commands to be the current end-effector pose
+        # self.ik_commands[env_ids] = ee_pose
+        # self.diff_ik_controller.reset(env_ids=env_ids) # Reset the differential IK controller       
+        # self.diff_ik_controller.set_command(self.ik_commands) # Set the initial IK commands
 
         # reset goal position
         rand_factor = torch.rand(len(env_ids), 3, device=self.device)
         self.target_pos[env_ids] = self.target_area[0] + rand_factor * (self.target_area[1] - self.target_area[0])
-        self.target_pos[env_ids,1] = self.cfg.target_pose[1] - 0.15 # keep y position constant
+        self.target_pos[env_ids,1] = self.cfg.target_pose[1] - 0.05 # keep y position constant
         # self.target_pos[env_ids,1] = distance_increase # keep y position constant
         # self.target_pos[env_ids,0] = torch.clamp(self.target_pos[env_ids,0],0.3,0.5)
         self.target_pos[env_ids,0] = self.cfg.target_pose[0] 
@@ -554,27 +548,27 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
 
         # update goal pose and markers
         self.goal_markers.visualize(self.target_pos, self.goal_rot)
-        self.reset_goal_buf[env_ids] = 0
+        # self.reset_goal_buf[env_ids] = 0
 
-        # reset object
-        objects_new_state = self.default_objects_state#[env_ids]# shape (num_envs, num_grans, 13)
-        rand_factor = torch.rand(len(env_ids), 3, device=self.device)
-        new_spawn_points = self.spawn_area[0] + rand_factor * (self.spawn_area[1] - self.spawn_area[0])
+        # # reset object
+        # objects_new_state = self.default_objects_state#[env_ids]# shape (num_envs, num_grans, 13)
+        # rand_factor = torch.rand(len(env_ids), 3, device=self.device)
+        # new_spawn_points = self.spawn_area[0] + rand_factor * (self.spawn_area[1] - self.spawn_area[0])
         # new_spawn_points[:,1] = self.cfg.spawn_area_radius # keep y position constant
-        new_spawn_points[:,1] = -1 * (self.cfg.target_pose[1] - 0.15)
-        new_spawn_points[:,0] = self.target_pos[env_ids,0] - self.scene.env_origins[env_ids,0]
-        objects_new_state[env_ids,:,:3] = self.get_spawn_points_hemisphere_batch(
-            spawn_area_radius=self.cfg.spawn_area_radius, 
-            centers=new_spawn_points, 
-            sphere_radius=(self.cfg.object_scale*math.sqrt(3))/2, 
-            n=self.cfg.num_grans
-        )
+        # # new_spawn_points[:,1] = -1 * (self.cfg.target_pose[1])
+        # new_spawn_points[:,0] = self.target_pos[env_ids,0] - self.scene.env_origins[env_ids,0]
+        # objects_new_state[env_ids,:,:3] = self.get_spawn_points_hemisphere_batch(
+        #     spawn_area_radius=self.cfg.spawn_area_radius, 
+        #     centers=new_spawn_points, 
+        #     sphere_radius=(self.cfg.object_scale*math.sqrt(3))/2, 
+        #     n=self.cfg.num_grans
+        # )
 
-        # objects_new_state[env_ids, :, 1] *= self.swap_goal[env_ids]
-        objects_new_state[env_ids, :, :3] += self.scene.env_origins[env_ids].unsqueeze(1)
-        objects_new_state[env_ids, :, 3:7] = self.unit_quat
-        objects_new_state[env_ids, :, 7:] = self.unit_vel
-        self._object_collection.write_object_state_to_sim(objects_new_state[env_ids], env_ids=env_ids)
+        # # objects_new_state[env_ids, :, 1] *= self.swap_goal[env_ids]
+        # objects_new_state[env_ids, :, :3] += self.scene.env_origins[env_ids].unsqueeze(1)
+        # objects_new_state[env_ids, :, 3:7] = self.unit_quat
+        # objects_new_state[env_ids, :, 7:] = self.unit_vel
+        # self._object_collection.write_object_state_to_sim(objects_new_state[env_ids], env_ids=env_ids)
 
         # Reset the epiode_reward
         self.episode_reward_sum[env_ids] = 0.0
@@ -582,10 +576,7 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
         # Refresh intermediate values for observations and rewards
         self._compute_intermediate_values(env_ids)
         # span distance between objects and target
-        # self.spawn_distance[env_ids] = torch.norm(self.target_pos.unsqueeze(1)[env_ids] - self.objects_pos[env_ids], dim=-1)
-
-        # Create spawn_distance only based on x,y coordinates
-        self.spawn_distance[env_ids] = torch.norm(self.target_pos[env_ids,:2].unsqueeze(1) - self.objects_pos[env_ids,:,:2], dim=-1)
+        self.spawn_distance[env_ids] = torch.norm(self.target_pos.unsqueeze(1)[env_ids] - self.objects_pos[env_ids], dim=-1)
 
         self.swap_goal *= -1
 
@@ -632,14 +623,13 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
         
         self.global_step += 1
 
-        if self.global_step % (self.max_episode_length / 16) == 0:
-            self.image_step += 1
-            save_grid_images_async(obs, 
-                        chosen_env=0, 
-                        step=self.image_step, 
-                        base_filename='grid_obs', 
-                        save_dir=self.grid_save_path,
-                        )
+        # if self.global_step % self.max_episode_length - 2 == 0:
+        #     save_grid_images_async(obs, 
+        #                 chosen_env=0, 
+        #                 step=self.global_step, 
+        #                 base_filename='grid_obs', 
+        #                 save_dir=self.grid_save_path,
+        #                 )
 
             
         #Flatten the obs in the last dimension
@@ -689,46 +679,40 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
         direction_penalty_scale,
     ):
 
-        # convert 3D coordinates to 2D
-        objects_pos = objects_pos[:,:,:2]
-        target_pos = target_pos[:,:2]
-        robot_grasp_pos = robot_grasp_pos[:,:2]
-
         ### Rewards for granules
         # Calculate current and previous distance to target for each object
         curr_goal_dist = torch.norm(objects_pos - target_pos.unsqueeze(1), p=2, dim=-1)  # shape (num_envs, num_grans)
         
         in_target = curr_goal_dist < self.cfg.goal_diameter/2
-        curr_goal_dist = torch.where(in_target, self.zero_tensor, curr_goal_dist)
+        # curr_goal_dist = torch.where(in_target, self.zero_tensor, curr_goal_dist)
         
-        # Calculate normalized goal distance reward
-        norm_goal_dist = 1 - torch.div(curr_goal_dist, spawn_distance)
-        norm_goal_dist = torch.where(norm_goal_dist < 0.0, self.zero_tensor, norm_goal_dist)
+        # # Calculate normalized goal distance reward
+        # norm_goal_dist = 1 - torch.div(curr_goal_dist, spawn_distance)
+        # norm_goal_dist = torch.where(norm_goal_dist < 0.0, self.zero_tensor, norm_goal_dist)
         
-        # Sum rewards across all objects and normalize
-        norm_goal_dist_sum = torch.sum(norm_goal_dist, dim=-1)
+        # # Sum rewards across all objects and normalize
+        # norm_goal_dist_sum = torch.sum(norm_goal_dist, dim=-1)
         
-        # Normalize by number of objects
-        norm_reward = norm_goal_dist_sum / self.cfg.num_grans
+        # # Normalize by number of objects
+        # norm_reward = norm_goal_dist_sum / self.cfg.num_grans
         
-        #### Rewards for EE being close to each object
-        d = torch.norm(objects_pos - robot_grasp_pos.unsqueeze(1), p=2, dim=-1)  # shape [num_envs, num_grans]
-        d = d * ~in_target  # Ignore objects already in target area
-        normalized_d = 1.0 / (1.0 + (d/0.2)**2)  # Apply 1/(1+(x/0.2)^2) to each distance
-        normalized_d = normalized_d * normalized_d
-        normalized_d = torch.where(d <= 0.1, normalized_d * 4, normalized_d)
-        # normalized_d = normalized_d * ~in_target  # Ignore objects already in target area
-        dist_reward = normalized_d.sum(dim=-1)  # shape [num_envs]
-        dist_reward = dist_reward / ((~in_target).sum())  # Normalize by number of objects
+        # #### Rewards for EE being close to each object
+        # d = torch.norm(objects_pos - robot_grasp_pos.unsqueeze(1), p=2, dim=-1)  # shape [num_envs, num_grans]
+        # d = d * ~in_target  # Ignore objects already in target area
+        # normalized_d = 1.0 / (1.0 + (d/0.2)**2)  # Apply 1/(1+(x/0.2)^2) to each distance
+        # normalized_d = normalized_d * normalized_d
+        # normalized_d = torch.where(d <= 0.1, normalized_d * 4, normalized_d)
+        # # normalized_d = normalized_d * ~in_target  # Ignore objects already in target area
+        # dist_reward = normalized_d.sum(dim=-1)  # shape [num_envs]
+        # dist_reward = dist_reward / ((~in_target).sum())  # Normalize by number of objects
 
-        # Total reward
-        rewards = (
-                  target_reward_scale * norm_reward 
-                # + dist_reward_scale * dist_reward
-        )
+        # # Total reward
+        # rewards = (
+        #           target_reward_scale * norm_reward 
+        #         # + dist_reward_scale * dist_reward
+        # )
 
-        # rewards = rewards + (1/self.cfg.num_grans)*in_target.sum(dim=-1)  # Add reward for each object in target area
-        rewards = rewards + in_target.sum(dim=-1)  # Add reward for each object in target area
+        rewards = in_target.sum(dim=-1)  # Add reward for each object in target area
         
         self.episode_reward_sum += rewards
 

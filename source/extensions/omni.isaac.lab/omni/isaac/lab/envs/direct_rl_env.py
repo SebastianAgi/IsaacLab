@@ -201,8 +201,8 @@ class DirectRLEnv(gym.Env):
         #################
         # Seb additions #
         #################
-        self.action_repeat = 4
-        print('num_repeat_actions: ',self.cfg.num_repeat_actions)
+        self.action_repeat = self.cfg.repeat_actions
+        print('num_repeat_actions: ',self.cfg.repeat_actions)
         self.current_action = torch.zeros(self.num_envs, self.action_space.shape[0], device=self.device)
         #################
 
@@ -330,7 +330,7 @@ class DirectRLEnv(gym.Env):
         # else:
         #     self._pre_physics_step(action)
         # for every 4th step, get new action
-        if self._sim_step_counter % self.cfg.num_repeat_actions == 0:
+        if self._sim_step_counter % self.action_repeat == 0:
             self.current_action = action
 
         # process actions

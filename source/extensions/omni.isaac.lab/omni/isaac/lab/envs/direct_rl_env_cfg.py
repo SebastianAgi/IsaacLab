@@ -222,3 +222,9 @@ class DirectRLEnvCfg:
       step will be performed after each time an environment is reset.
 
     """
+
+    observation_dir: str = ""  # Default empty string
+
+    repeat_actions: int = 1  # Number of times to repeat the same action before sending a new action to the environment
+
+    obs_chunk: int = 1  # Number of chunks to process objects for grid building

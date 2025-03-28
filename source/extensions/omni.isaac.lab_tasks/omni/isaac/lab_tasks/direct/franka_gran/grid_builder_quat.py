@@ -2,37 +2,12 @@ import matplotlib.pyplot as plt
 from pytictac import Timer
 import torch
 import math
-
-
-@torch.jit.script
-def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
-    """Convert rotations given as quaternions to rotation matrices.
-
-    Args:
-        quaternions: The quaternion orientation in (w, x, y, z). Shape is (..., 4).
-
-    Returns:
-        Rotation matrices. The shape is (..., 3, 3).
-    """
-    r, i, j, k = torch.unbind(quaternions, -1)
-    # pyre-fixme[58]: `/` is not supported for operand types `float` and `Tensor`.
-    two_s = 2.0 / (quaternions * quaternions).sum(-1)
-
-    o = torch.stack(
-        (
-            1 - two_s * (j * j + k * k),
-            two_s * (i * j - k * r),
-            two_s * (i * k + j * r),
-            two_s * (i * j + k * r),
-            1 - two_s * (i * i + k * k),
-            two_s * (j * k - i * r),
-            two_s * (i * k - j * r),
-            two_s * (j * k + i * r),
-            1 - two_s * (i * i + j * j),
-        ),
-        -1,
-    )
-    return o.reshape(quaternions.shape[:-1] + (3, 3))
+from omni.isaac.lab.utils.math import matrix_from_quat
+import cv2
+import numpy as np
+import threading
+import os
+import wandb
 
 @torch.jit.script
 def batch_get_downward_yaw_tensor_vectorized(quaternions: torch.Tensor) -> torch.Tensor:
@@ -147,6 +122,55 @@ def object_layer(obj_mask: torch.Tensor, obj_pos_chunk: torch.Tensor,
     return obj_mask
 
 
+def save_grid_images_async(grid_tensor: torch.Tensor, 
+                           chosen_env: int, 
+                           step: int, 
+                           base_filename: str, 
+                           save_dir: str, 
+                           log_to_wandb: bool = True):
+    """
+    Save each environment's grid (shape [3, H, W]) as an image in the specified directory.
+    
+    Args:
+        grid_tensor: Tensor of shape [num_envs, 3, H, W] with values in [0, 1].
+        base_filename: Base filename to which an index will be appended.
+        save_dir: Directory in which to save the images.
+    """
+    # Ensure the save directory exists.
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Detach and move the grid tensor to CPU.
+    grid_np = grid_tensor.detach().cpu().numpy()  # shape: [num_envs, 3, H, W]
+
+    # Extract one environment's grid.
+    img = grid_np[chosen_env]  # shape: [3, H, W]
+    # Transpose to [H, W, 3]
+    img = np.transpose(img, (1, 2, 0))
+    # Scale from [0, 1] to [0, 255] and convert to uint8.
+    img = (img * 255).astype(np.uint8)
+    # Build the filename.
+    filename = os.path.join(save_dir, f"{base_filename}_{step}.png")
+    
+    def writer_and_logger(im, fn, global_step):
+        # Save image to disk
+        cv2.imwrite(fn, im)
+        
+        # Log to wandb if requested
+        if log_to_wandb:
+            try:
+                # Log the image to wandb
+                wandb.log({
+                    "observation_grid": wandb.Image(im)
+                }, step=global_step)
+            except Exception as e:
+                print(f"Error logging to wandb: {e}")
+    
+    # Launch the writer and logger in a separate thread.
+    threading.Thread(target=writer_and_logger, 
+                    args=(img, filename, step), 
+                    daemon=True).start()
+
+
 class GridObservationGenerator:
     def __init__(self, grid_shape=(256, 256), area = (0.65,0.75), device="cuda", dtype=torch.float16):
         """Initialize with fixed grid properties."""
@@ -175,8 +199,9 @@ class GridObservationGenerator:
         end_effector_orientation: torch.Tensor, # shape (num_envs,)
         target_radius: float = 0.1,
         object_size: float = 0.01,
-        end_effector_length: float = 0.05,
-        end_effector_width: float = 0.01
+        end_effector_length: float = 0.01,
+        end_effector_width: float = 0.05,
+        chunk_size: int = 1,
     ) -> torch.Tensor:
         """Generate 3-channel grid observations for multiple environments.
         
@@ -207,7 +232,7 @@ class GridObservationGenerator:
         # Layer 2: Objects (process objects in chunks to limit broadcast size)
         # Instead of broadcasting over all objects at once, process them in smaller chunks.
         obj_mask = torch.zeros((num_envs, H, W), device=self.device, dtype=torch.bool)
-        chunk_size = 1  # Adjust this based on your memory/performance trade-off.
+        # chunk_size = 1  # Adjust this based on your memory/performance trade-off.
         for i in range(0, num_obj, chunk_size):
             end_i = min(i + chunk_size, num_obj)
             # Extract a chunk of objects: shape (num_envs, chunk_size, 2) and (num_envs, chunk_size)
@@ -231,10 +256,10 @@ class GridObservationGenerator:
 
 if __name__ == "__main__":
     # Initialize the generator.
-    grid_gen = GridObservationGenerator(grid_shape=(256,256), area=(0.65, 0.75), dtype=torch.float16)
+    grid_gen = GridObservationGenerator(grid_shape=(96,96), area=(0.65, 0.75), dtype=torch.float16)
     
     # Test with 400 environments and 10 objects each.
-    num_envs = 400
+    num_envs = 4096
     num_obj = 10
     obj_pos = torch.rand((num_envs, num_obj, 2), device='cuda') * 0.65
     obj_pos[:, 0, :] = torch.tensor([0.65/2, 0.75/2])
