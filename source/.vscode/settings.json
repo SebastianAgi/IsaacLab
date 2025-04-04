@@ -3,5 +3,6 @@
         "./extensions/omni.isaac.lab",
         "./extensions/omni.isaac.lab_assets",
         "./extensions/omni.isaac.lab_tasks"
-    ]
+    ],
+    "ros.distro": "noetic"
 }
