@@ -1,3 +1,9 @@
+[project]
+name = "isaaclab"
+version = "4.5.0"
+description = "IsaacLab RL and robotics framework"
+dependencies = []
+
 [tool.isort]
 
 py_version = 310
