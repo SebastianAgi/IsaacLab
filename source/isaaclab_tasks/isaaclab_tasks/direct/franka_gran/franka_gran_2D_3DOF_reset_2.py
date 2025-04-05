@@ -1,0 +1,1007 @@
+# Custom DirectRL Environment for Pushing Obstacles to a Target Area
+
+from __future__ import annotations
+
+import torch
+import math
+
+from isaaclab.assets.rigid_object_collection.rigid_object_collection import RigidObjectCollection
+import isaaclab.sim as sim_utils
+from isaacsim.core.utils.stage import get_current_stage # type: ignore # get_current_stage is in this module
+from isaacsim.core.utils.torch.transformations import tf_combine, tf_inverse, tf_vector # type: ignore
+from pxr import UsdGeom
+import tqdm
+import wandb
+
+from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.markers.config import FRAME_MARKER_CFG
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import quat_mul, sample_uniform, subtract_frame_transforms, axis_angle_from_quat, quat_inv, yaw_quat
+from .franka_gran_cfg import FrankaGranCfg
+
+from pytictac import Timer
+
+# ignore warnings
+import warnings
+warnings.filterwarnings("ignore")
+
+
+class FrankaGran2D3DOFReset2(DirectRLEnv):
+    """RL Environment where the action space is the end-effector pose (position + orientation)."""
+
+    # pre-physics step calls
+    #   |-- _pre_physics_step(action)
+    #   |-- _pre_physics_step_through(action)
+    #   |-- _apply_action()
+    # post-physics step calls
+    #   |-- _get_dones()
+    #   |-- _get_rewards()
+    #   |-- _reset_idx(env_ids)
+    #   |-- _get_observations()
+
+    @torch.jit.script
+    def quaternion_to_yaw(quat):
+        """Convert a quaternion to a yaw angle (rotation around the z-axis in radians)."""
+        # Extract the components of the quaternion
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        
+        # Compute the yaw angle in radians
+        yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        
+        return yaw
+    
+    @torch.jit.script
+    def z_rotation_quaternion(delta_theta: torch.Tensor) -> torch.Tensor:
+        # Returns a tensor of quaternions [w, x, y, z] for rotation about the z-axis for each delta_theta
+        return torch.stack([
+            torch.cos(delta_theta / 2),
+            torch.zeros_like(delta_theta),
+            torch.zeros_like(delta_theta),
+            torch.sin(delta_theta / 2)
+        ], dim=-1)
+    
+    @torch.jit.script
+    def yaw_to_quaternion(yaw, num_envs: int):
+        """Convert a yaw angle (rotation around the z-axis in radians) to a quaternion."""
+        quat = torch.zeros((num_envs, 4), dtype=torch.float, device=yaw.device)
+        quat[:, 0] = torch.cos(yaw / 2)
+        quat[:, 3] = torch.sin(yaw / 2)
+
+        return quat
+
+    @torch.jit.script
+    def get_spawn_points_hemisphere_batch(
+        centers: torch.Tensor,
+        spawn_area_radius: float,
+        sphere_radius: float,
+        n: int,
+        max_attempts: int = 10000
+    ) -> torch.Tensor:
+        """
+        Generate n non-overlapping spawn points in a hemispherical area for each center in a batch,
+        using only tensor operations for the batch dimension.
+
+        Args:
+            centers (Tensor): A tensor of shape (m, 3) where m is the number of centers.
+            spawn_area_radius (float): The maximum radial distance from each center.
+            sphere_radius (float): The radius of each object.
+            n (int): The number of spawn points to generate per center.
+            max_attempts (int): Maximum candidate generation attempts.
+
+        Returns:
+            Tensor: An (m, n, 3) tensor where each (n, 3) slice contains spawn points for one center.
+
+        Raises:
+            RuntimeError: If fewer than n valid points can be generated for some centers.
+        """
+        m = centers.size(0)  # number of centers
+        accepted = torch.empty((m, n, 3), dtype=torch.float32, device=centers.device)
+        # count[i] will hold the number of spawn points accepted so far for center i.
+        count = torch.zeros((m,), dtype=torch.int32, device=centers.device)
+        attempts = 0
+        two_radius = 2 * sphere_radius
+        spawn_height = 2 * spawn_area_radius
+
+        # Continue until every center has n points or we exceed max_attempts.
+        while (count < n).any() and attempts < max_attempts:
+            # Generate one candidate for each center in parallel.
+            # Sample uniformly from a circular disk in the xy-plane:
+            r = spawn_area_radius * torch.sqrt(torch.rand(m, device=centers.device))
+            theta = 2 * math.pi * torch.rand(m, device=centers.device)
+            x_offset = r * torch.cos(theta)
+            y_offset = r * torch.sin(theta)
+
+            # Sample z uniformly over the desired height.
+            # For example, if spawn_height is a new parameter that defines the vertical span:
+            z_offset = torch.rand(m, device=centers.device) * spawn_height
+
+            # Form the candidate points:
+            candidate = centers + torch.stack([x_offset, y_offset, z_offset], dim=1)  # shape (m, 3)
+
+            # Only consider centers that still need points.
+            still_need = (count < n)
+
+            # For each center, we must check the candidate against all accepted spawn points so far.
+            # We'll compare candidate (m,3) against accepted (m,n,3) as follows:
+            #   1. Expand candidate to (m, n, 3)
+            #   2. Compute Euclidean distances between candidate and each accepted point.
+            candidate_exp = candidate.unsqueeze(1).expand(m, n, 3)  # shape (m, n, 3)
+            diff = candidate_exp - accepted  # shape (m, n, 3)
+            dists = torch.sqrt(torch.sum(diff * diff, dim=2))  # shape (m, n)
+
+            # Because each center i has only count[i] valid accepted points (stored in accepted[i, 0:count[i]]),
+            # we create a mask to “ignore” unused rows. For each center i, let j be an index:
+            indices = torch.arange(n, device=centers.device).unsqueeze(0).expand(m, n)  # (m, n)
+            valid_mask = indices < count.unsqueeze(1)  # (m, n) mask: True for accepted indices.
+
+            # For j not yet used (i.e. j >= count[i]), set the distance to a large number so that they don't affect rejection.
+            dists_masked = torch.where(valid_mask, dists, torch.full_like(dists, 1e9))
+
+            # A candidate is valid for center i if:
+            #   - No accepted point (if any) is closer than 2*sphere_radius.
+            #   - (Or if count[i]==0, the candidate is automatically valid.)
+            min_dists, _ = torch.min(dists_masked, dim=1)  # (m,)
+            candidate_valid = (count == 0) | (min_dists >= two_radius)
+            # Also require that the center still needs more points.
+            candidate_valid = candidate_valid & still_need
+
+            # For all centers where candidate_valid is True, update the accepted points.
+            # Use advanced indexing to update accepted[i, count[i]] = candidate[i] for each valid center.
+            valid_centers = torch.nonzero(candidate_valid).squeeze(1)
+            if valid_centers.numel() > 0:
+                # For these centers, the column to update is given by count[valid_centers].
+                col_indices = count.index_select(0, valid_centers).to(torch.int64)
+                accepted[valid_centers, col_indices] = candidate.index_select(0, valid_centers)
+                # Increment count for these centers.
+                count.index_put_((valid_centers,), count.index_select(0, valid_centers) + 1)
+            attempts += 1
+
+        if (count < n).any():
+            raise RuntimeError("Could not generate enough non-overlapping spawn points for some centers.")
+        return accepted
+
+    cfg: FrankaGranCfg
+    
+    def __init__(self, cfg: FrankaGranCfg, render_mode: str | None = None, **kwargs):
+        # with Timer("__init__", verbose=True):
+        super().__init__(cfg, render_mode, **kwargs)
+
+        def get_env_local_pose(env_pos: torch.Tensor, xformable: UsdGeom.Xformable, device: torch.device):
+                """Compute pose in env-local coordinates."""
+                world_transform = xformable.ComputeLocalToWorldTransform(0)
+                world_pos = world_transform.ExtractTranslation()
+                world_quat = world_transform.ExtractRotationQuat()
+
+                px = world_pos[0] - env_pos[0]
+                py = world_pos[1] - env_pos[1]
+                pz = world_pos[2] - env_pos[2]
+                qx = world_quat.imaginary[0]
+                qy = world_quat.imaginary[1]
+                qz = world_quat.imaginary[2]
+                qw = world_quat.real
+
+                return torch.tensor([px, py, pz, qw, qx, qy, qz], device=device)
+
+        # Initialize target positions and obstacles
+        self.init_spawn_point = torch.tensor(cfg.init_spawn_point, dtype=torch.float, device=self.device)
+        self.objects_pos = torch.zeros((self.num_envs, self.cfg.num_grans, 3), dtype=torch.float, device=self.device)
+        self.objects_pos[:,:,:] = self.get_spawn_points_hemisphere_batch(
+            centers=self.init_spawn_point.repeat(self.num_envs, 1), 
+            spawn_area_radius=cfg.spawn_area_radius, 
+            sphere_radius=(self.cfg.object_scale*math.sqrt(3))/2, 
+            n=self.cfg.num_grans
+        )
+        self.spawn_area = torch.tensor(cfg.valid_spawn_area, dtype=torch.float, device=self.device)
+        self.spawn_pos = torch.zeros((self.num_envs, self.cfg.num_grans, 3), dtype=torch.float, device=self.device)
+        self.spawn_pos[:, :, :] = torch.tensor(cfg.spawn_pose, dtype=torch.float, device=self.device)
+        self.target_area = torch.tensor(cfg.valid_target_area, dtype=torch.float, device=self.device)
+        self.target_pos = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
+        self.target_pos[:, :] = torch.tensor(cfg.target_pose, dtype=torch.float, device=self.device)
+        self.spawn_distance = torch.norm(self.target_pos.unsqueeze(1) - self.spawn_pos, p=2, dim=-1) # shape (num_envs, num_grans)
+
+        self.randomize_target = True
+
+        self.objects_pos_mean = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
+
+        self.robot_dof_targets = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
+
+        self.dt = self.cfg.sim.dt * self.cfg.decimation
+
+        # Create auxiliary variables for computing applied action, observations, and rewards
+        self.robot_dof_lower_limits = self._robot.data.soft_joint_pos_limits[0, :, 0].to(device=self.device)
+        self.robot_dof_upper_limits = self._robot.data.soft_joint_pos_limits[0, :, 1].to(device=self.device)
+
+        self.robot_dof_speed_scales = torch.ones_like(self.robot_dof_lower_limits)
+        self.robot_dof_targets = torch.zeros((self.num_envs, self._robot.num_joints), device=self.device)
+
+        ## MISC
+
+        #unit quaternion
+        self.unit_quat = torch.tensor([1, 0, 0, 0], dtype=torch.float, device=self.device)
+        self.all_env_unit_quat = self.unit_quat.repeat((self.num_envs, 1))
+        #unit lin vel & ang vel
+        self.unit_vel = torch.zeros(6, dtype=torch.float, device=self.device)
+        # Zero tensor
+        self.zero_tensor = torch.tensor(0.0, device=self.device)
+        # 1 tensor
+        self.one_tensor = torch.tensor(1.0, device=self.device)
+        # 0.1 tensor
+        self.point1_tensor = torch.tensor(0.1, device=self.device)
+        # wandb counter
+        self.global_step = torch.tensor(0, device=self.device)
+        # Default objects state shape (num_instances, num_objects, 13)
+        self.default_objects_state = torch.zeros((self.num_envs, self.cfg.num_grans, 13), dtype=torch.float, device=self.device)
+        # Reset rollout actions
+        self.reset_actions = torch.zeros((self.num_envs, 7), device=self.device)
+        # Quaternion for 90 degree rotation around x-axis
+        self.rot_90_x = torch.tensor([0.7071, 0, 0, 0.7071], device=self.device).repeat(self.num_envs, 1)
+        # Quaternion for 180 degree rotation around x-axis
+        self.rot_180_x = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
+        # Episode reward sum
+        self.episode_reward_sum = torch.zeros(self.num_envs, device=self.device)
+        # complete task counter
+        self.reached_goal_state_count = torch.tensor(0.0, device=self.device)
+        # Spawn_area_radius tensor
+        self.current_spawn_radius = torch.tensor(cfg.spawn_area_radius, device=self.device)
+        # Init Joint position
+        self.init_joint_pos = torch.tensor([0.0, 0.0, 0.0, -3.14/2, 0.0, 3.14/2, -3.14/4], dtype=torch.float, device=self.device)
+
+        # terms to make reward only for when the objects move
+        self.prev_objects_pos = torch.zeros((self.num_envs, self.cfg.num_grans, 3), dtype=torch.float, device=self.device)
+        self.min_movement_threshold = torch.tensor(0.0001, device=self.device)  # Minimum distance to consider as movement
+
+        # Set up grasp and push targets for pushing obstacles
+        stage = get_current_stage()
+        hand_pose = get_env_local_pose(
+            self.scene.env_origins[0],
+            UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/Robot/panda_link7")),
+            self.device,
+        )
+        # The pose of the tip of the end-effector pusher center
+        pusher_pose = get_env_local_pose(
+            self.scene.env_origins[0],
+            UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/Robot/panda_fingertip_centered_point")),
+            self.device,
+        )
+
+        # End effector pose and orientation in the robot's local frame
+        self.ee_position = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device) # Position (x, y, z)
+        self.ee_position[:, :3] = hand_pose[0:3]
+        self.ee_orientation = torch.zeros((self.num_envs, 4), dtype=torch.float, device=self.device) # Quaternion (w, x, y, z)
+        self.ee_orientation_controller = torch.zeros((self.num_envs, 4), dtype=torch.float, device=self.device) # Quaternion (w, x, y, z)
+        self.ee_orientation[:, :] = hand_pose[3:]
+        self.init_ee_orientation = self.ee_orientation.clone()
+
+        hand_pose_inv_rot, hand_pose_inv_pos = tf_inverse(hand_pose[3:7], hand_pose[0:3])
+
+        robot_local_grasp_pose_rot, robot_local_grasp_pose_pos = tf_combine(
+            hand_pose_inv_rot, hand_pose_inv_pos, pusher_pose[3:7], pusher_pose[0:3]
+        )
+        robot_local_grasp_pose_pos += torch.tensor([0, 0.04, 0], device=self.device)
+        self.robot_local_grasp_pos = robot_local_grasp_pose_pos.repeat((self.num_envs, 1))
+        self.robot_local_grasp_rot = robot_local_grasp_pose_rot.repeat((self.num_envs, 1))
+
+        self.hand_link_idx = self._robot.find_bodies("panda_link7")[0][0]
+
+        # Initialize the goal rotation
+        self.goal_rot = torch.zeros((self.num_envs, 4), dtype=torch.float, device=self.device)
+        self.goal_rot[:, 0] = 1.0
+
+        # Create initial object poses
+        self.objects_state = torch.zeros((self.num_envs, self.cfg.num_grans, 13), dtype=torch.float, device=self.device)
+        self.objects_state[:, :, :3] = self.objects_pos
+        self.objects_state[:, :, 3:7] = self.unit_quat   
+
+        # Do not let objects exceed the total spawn area of cfg.full_spawn_area
+        self.objects_state[:, :, 0] = torch.clamp(self.objects_state[:, :, 0], 
+                                                (self.scene.env_origins[:, 0] + self.spawn_area[0][0]).unsqueeze(1), 
+                                                (self.scene.env_origins[:, 0] + self.spawn_area[1][0]).unsqueeze(1))  
+        self.objects_state[:, :, 1] = torch.clamp(self.objects_state[:, :, 1], 
+                                                (self.scene.env_origins[:, 1] + self.spawn_area[0][1]).unsqueeze(1), 
+                                                (self.scene.env_origins[:, 1] + self.spawn_area[1][1]).unsqueeze(1))
+
+        self.scale_tensor = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
+        self.scale_tensor[:,:] = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float, device=self.device)
+
+        # Change the objects position to the spawn points
+        self._object_collection.write_object_state_to_sim(self.objects_state)     
+        
+        # Markers
+        self.ee_marker = VisualizationMarkers(self.cfg.ee_pose_marker_cfg)
+        self.ee_goal_marker = VisualizationMarkers(self.cfg.ee_goal_marker_cfg)
+        self.goal_markers = VisualizationMarkers(self.cfg.goal_object_cfg)
+        self.mean_marker = VisualizationMarkers(self.cfg.mean_object_cfg)
+        self.reset_init_marker = VisualizationMarkers(self.cfg.ee_goal_marker_cfg)
+        self.origin_marker = VisualizationMarkers(self.cfg.ee_goal_marker_cfg)
+
+        # track goal resets
+        self.reset_goal_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        self.robot_grasp_rot = torch.zeros((self.num_envs, 4), device=self.device)
+        self.robot_grasp_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        self.robot_grasp_pose = torch.zeros((self.num_envs, 7), device=self.device)
+
+        self.swap_goal = torch.rand((self.num_envs, 1), device=self.device)
+        self.swap_goal = torch.where(self.swap_goal < 0.5, 1, -1) # Set everything over 0.5 to 1, and everything below to -1
+
+        # Specify robot-specific parameters (for the differential IK controller)
+        if self.cfg.robot_name == "franka_panda":
+            self.robot_entity_cfg = SceneEntityCfg("robot", joint_names=["panda_joint.*"], body_names=["panda_hand"])
+        elif self.cfg.robot_name == "ur10":
+            self.robot_entity_cfg = SceneEntityCfg("robot", joint_names=[".*"], body_names=["ee_link"])
+
+        else:
+            raise ValueError(f"Robot {self.cfg.robot} is not supported. Valid: franka_panda, ur10")
+
+        self.robot_entity_cfg.resolve(self.scene)
+
+        if self._robot.is_fixed_base:
+            self.ee_jacobi_idx = self.robot_entity_cfg.body_ids[0] - 1
+        else:
+            self.ee_jacobi_idx = self.robot_entity_cfg.body_ids[0]
+
+        self.bap = torch.tensor([0.0, 1.0, 0.0, 0.0], device=self.device)
+        self.bapkus = torch.tensor([0.0, 0.001, 0.0, 0.0], device=self.device)
+
+
+    def _setup_scene(self):
+        # with Timer("_setup_scene", verbose=True):
+        """Set up the scene, including loading the Franka arm and other relevant objects."""
+        self._robot = Articulation(self.cfg.robot_high_pd) # GRAVITY DISABLED - diff_ik only works with gravity disabled
+        self._table = RigidObject(self.cfg.table_cfg)
+        self._object_collection = RigidObjectCollection(self.cfg.object_collection)
+        self.scene.articulations["robot"] = self._robot
+        self.scene.rigid_objects["table"] = self._table
+        self.scene.rigid_object_collections["object_collection"] = self._object_collection
+
+        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+
+        # Clone, filter, and replicate the environment
+        self.scene.clone_environments(copy_from_source=False)
+        self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
+        
+        # Add lights
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
+
+        # Create controller
+        self.diff_ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="dls")
+        self.diff_ik_controller = DifferentialIKController(self.diff_ik_cfg, num_envs=self.num_envs, device=self.device)
+
+        self.ik_commands = torch.zeros(self.num_envs, self.diff_ik_controller.action_dim, device=self.device)
+
+    def _pre_physics_step(self, actions: torch.Tensor):
+        # Actions are in the order [dx, dy, yaw_rad]
+
+        # with Timer("_pre_physics_step", verbose=True):
+        # Clamp and scale the actions
+        self.actions = actions.clone().clamp(-1.0, 1.0)
+
+        delta_position = self.actions[:, :2] * self.cfg.action_scale * self.dt
+
+        # Update the end effector position and orientation
+        self.ee_position[:,:2] += delta_position[:,:2]
+        self.ee_position[:, 0] = torch.clamp(self.ee_position[:, 0], 0.075, 0.725)
+        self.ee_position[:, 1] = torch.clamp(self.ee_position[:, 1], -0.375, 0.375)
+        # self.ee_position[:, 2] = torch.clamp(self.ee_position[:, 2], self.robot_local_grasp_pos[0, 2], 0.4) 
+        self.ee_position[:, 2] = self.robot_local_grasp_pos[:,2]  - 0.118
+
+        # Compute the new yaw angle
+        delta_yaw = self.actions[:, 2] * 7.5 * self.dt
+        current_yaw = self.quaternion_to_yaw(self.robot_grasp_rot)
+        
+        clamped_yaw = torch.where((
+            (delta_yaw + current_yaw > self.robot_dof_lower_limits[6]) 
+            |                      # or
+            (delta_yaw + current_yaw < self.robot_dof_upper_limits[6])),
+            delta_yaw,
+            0.0)
+
+        # Convert the clamped yaw angle to a quaternion
+        clamped_yaw_quat = self.yaw_to_quaternion(clamped_yaw, self.num_envs)
+        # convert the current yaw to quaternion
+        self.ee_orientation = self.yaw_to_quaternion(current_yaw, self.num_envs)
+
+        self.ee_orientation = quat_mul(self.ee_orientation, self.rot_180_x)
+
+        # Update the end effector orientation
+        self.ee_orientation = quat_mul(self.ee_orientation, clamped_yaw_quat)
+
+        # self.ee_orientation[:, :] = torch.tensor([3.5739e-08, -9.4628e-01, -3.2336e-01, -8.1139e-08], device=self.device)
+
+        # Set the updated pose as the IK command
+        self.ik_commands = torch.cat((self.ee_position, self.ee_orientation), dim=-1)
+        # Set the IK command for the differential IK controller
+        self.diff_ik_controller.set_command(self.ik_commands)
+
+        # visualize the goal pose
+        self.ik_commands[:, 2] += 1.05 #add 1.05 to the z value as robot is lifter by 1.05
+        self.ee_goal_marker.visualize(
+            translations=self.ik_commands[:,:3] + self.scene.env_origins, 
+            orientations=self.ik_commands[:,3:7], 
+            scales= self.scale_tensor,
+            marker_indices=None)
+        
+        # Visualize the mean object position
+        self.mean_marker.visualize(self.objects_pos_mean, self.all_env_unit_quat)
+
+    def _pre_physics_step_through(self, start_pose: torch.Tensor):
+        # Actions are in the order [dx, dy, yaw_rad]
+
+        # with Timer("_pre_physics_step_through", verbose=True):
+        # Set the updated pose as the IK command
+        self.ik_commands = torch.cat((start_pose[:,0:3], start_pose[:,3:7]), dim=-1)
+        # Set the IK command for the differential IK controller
+        self.diff_ik_controller.set_command(self.ik_commands)
+
+        # visualize the goal pose
+        self.ik_commands[:, 2] += 1.05 #add 1.05 to the z value as robot is lifter by 1.05
+        self.ee_goal_marker.visualize(
+            translations=self.ik_commands[:,:3] + self.scene.env_origins, 
+            orientations=self.ik_commands[:,3:7], 
+            scales= self.scale_tensor,
+            marker_indices=None)
+        
+        # # Make sure no particle is outside the spawn area
+        # self.objects_state[:, :, 0] = 
+
+    def _apply_action(self):
+        # with Timer("_apply_action", verbose=True):
+        """Apply actions to the simulator."""
+        # Obtain quantities from simulation
+        jacobian = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
+        ee_pose_w = self._robot.data.body_state_w[:, self.robot_entity_cfg.body_ids[0], 0:7]
+        root_pose_w = self._robot.data.root_state_w[:, 0:7]
+        joint_pos = self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids]
+        
+        # Compute frame in root frame
+        self.ee_position, self.ee_orientation_controller = subtract_frame_transforms(
+            root_pose_w[:, 0:3], root_pose_w[:, 3:7], ee_pose_w[:, 0:3], ee_pose_w[:, 3:7]
+        )
+        
+        # Compute the joint commands using the differential IK controller
+        joint_pos_des = self.diff_ik_controller.compute(self.ee_position, self.ee_orientation_controller, jacobian, joint_pos)
+        
+        # Apply the joint position targets to the robot
+        self._robot.set_joint_position_target(joint_pos_des, joint_ids=self.robot_entity_cfg.joint_ids)
+
+        # Update the end effector marker position and orientation
+        ee_pos = ee_pose_w[:, 0:3]
+        ee_quat = ee_pose_w[:, 3:7]
+        self.ee_marker.visualize(ee_pos, ee_quat)
+
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # with Timer("_get_dones", verbose=True):
+        """Determine if environments are done."""
+
+        self._compute_intermediate_values()
+
+        # Done if timeout occurs
+        terminated = (self.objects_pos[:,:, 2] < 0.5).any(dim=1)
+        # Done if all objects are within a certain distance of the target
+        terminated2 = ((torch.norm(self.objects_pos - self.target_pos.unsqueeze(1), p=2, dim=-1)).mean(dim=-1)) < self.cfg.goal_radius
+        self.reached_goal_state_count += terminated2.sum()
+        terminated = terminated | terminated2
+        # terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        timeouts = self.episode_length_buf >= self.max_episode_length -1
+        
+        return terminated, timeouts
+
+    def _get_rewards(self) -> torch.Tensor:
+        # with Timer("_get_rewards", verbose=True):
+        """Compute and return rewards for each environment."""
+        # Refresh the intermediate values after the physics step
+        self._compute_intermediate_values()
+
+        return self._compute_rewards(
+            self.objects_pos,
+            self.objects_pos_mean,
+            self.target_pos,
+            self.robot_grasp_pos,
+            self.spawn_distance,
+            self.actions,
+            self.cfg.target_reward_scale,
+            self.cfg.action_penalty_scale,
+            self.cfg.dist_reward_scale,
+            self.cfg.direction_penalty_scale,
+        )
+    
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        # with Timer("_reset_idx", verbose=True):
+        if env_ids is None:
+            env_ids = self._robot._ALL_INDICES
+        super()._reset_idx(env_ids)
+
+        # Reset the robot state
+        joint_pos = self._robot.data.default_joint_pos[env_ids] + sample_uniform(
+            -0.05,
+            0.05,
+            (len(env_ids), self._robot.num_joints),
+            self.device,
+        )
+        joint_pos = torch.clamp(joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
+        joint_vel = torch.zeros_like(joint_pos)
+        self._robot.set_joint_position_target(joint_pos, env_ids=env_ids)
+        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+        self.scene.write_data_to_sim()
+        self.sim.step(render=True)
+
+        # Increase the distance between target position and object position 
+        success_threshold_distance = 100
+        distance_increment = 0.1
+        distance_increment_steps = torch.div(self.reached_goal_state_count, success_threshold_distance, rounding_mode='floor')
+        distance_increase = distance_increment_steps * distance_increment + self.cfg.target_pose[1]
+
+        # reset goal position
+        rand_factor = torch.rand(len(env_ids), 3, device=self.device)
+        self.target_pos[env_ids] = self.target_area[0] + rand_factor * (self.target_area[1] - self.target_area[0])
+        # self.target_pos[env_ids,1] = self.cfg.target_pose[1] # keep y position constant
+        self.target_pos[env_ids,1] = distance_increase # keep y position constant
+        # self.target_pos[env_ids,0] = torch.clamp(self.target_pos[env_ids,0],0.3,0.5)
+        self.target_pos[env_ids,0] = self.cfg.target_pose[0]
+        # self.target_pos[env_ids,1] *= self.swap_goal.squeeze(1)[env_ids]
+        self.target_pos[env_ids] = self.target_pos[env_ids] + self.scene.env_origins[env_ids]
+
+        # update goal pose and markers
+        self.goal_markers.visualize(self.target_pos, self.goal_rot)
+        self.reset_goal_buf[env_ids] = 0
+
+        self.origin_marker.visualize(self.scene.env_origins[:], self.all_env_unit_quat[:])
+
+        # Increase spawn_area_radius depending on how many times the goal has been reached
+        success_threshold_spawn_radius = 3000
+        radius_increment = self.cfg.spawn_area_radius
+        increment_steps = torch.div(self.reached_goal_state_count, success_threshold_spawn_radius, rounding_mode='floor')
+        current_radius = self.cfg.spawn_area_radius + (increment_steps * radius_increment)
+        self.current_spawn_radius = torch.clamp(current_radius, self.cfg.spawn_area_radius, self.cfg.goal_radius)
+
+
+        # reset object
+        objects_new_state = self.default_objects_state#[env_ids]# shape (num_envs, num_grans, 13)
+        rand_factor = torch.rand(len(env_ids), 3, device=self.device)
+        new_spawn_points = self.spawn_area[0] + rand_factor * (self.spawn_area[1] - self.spawn_area[0])
+        new_spawn_points[:,1] = self.cfg.spawn_area_radius # keep y position constant
+        new_spawn_points[:,0] = self.target_pos[env_ids,0] - self.scene.env_origins[env_ids,0]
+        objects_new_state[env_ids,:,:3] = self.get_spawn_points_hemisphere_batch(
+            spawn_area_radius=self.cfg.spawn_area_radius, 
+            centers=new_spawn_points, 
+            sphere_radius=(self.cfg.object_scale*math.sqrt(3))/2, 
+            n=self.cfg.num_grans
+        )
+
+        # objects_new_state[env_ids, :, 1] *= self.swap_goal[env_ids]
+        objects_new_state[env_ids, :, :3] += self.scene.env_origins[env_ids].unsqueeze(1)
+        objects_new_state[env_ids, :, 3:7] = self.unit_quat
+        objects_new_state[env_ids, :, 7:] = self.unit_vel
+        self._object_collection.write_object_state_to_sim(objects_new_state[env_ids], env_ids=env_ids)
+
+        # Reset the epiode_reward
+        self.episode_reward_sum[env_ids] = 0.0
+
+        ##############################################################################################
+        # Step through the physics engine to settle the objects and to get arm in the right position #
+        ##############################################################################################
+
+        # First compute object positions to get target spawn point
+        self._compute_intermediate_values(env_ids)
+        
+        # Calculate desired end-effector position (relative to robot base)
+        desired_pos, desired_quat = self._compute_spawn_point(env_ids)
+        desired_pos[:, 2] = self.robot_local_grasp_pos[env_ids, 2] - 0.118
+        
+        # Store the initial orientation for future reference
+        self.init_ee_orientation[env_ids] = desired_quat
+        
+        # Solve IK with retries and error checking
+        success = self._solve_ik_with_retries(
+            env_ids, 
+            desired_pos, 
+            desired_quat, 
+            max_iterations=200, 
+            max_attempts=10, 
+            error_threshold=0.001
+        )
+
+        ##############################################################################################
+        ##############################################################################################
+
+        # Refresh intermediate values for observations and rewards
+        self._compute_intermediate_values(env_ids)
+        # span distance between objects and target
+        self.spawn_distance[env_ids] = torch.norm(self.target_pos.unsqueeze(1)[env_ids] - self.objects_pos[env_ids], dim=-1)
+
+        self.swap_goal *= -1
+
+    def _solve_ik_with_retries(self, env_ids, desired_pos, desired_quat, max_iterations=20, max_attempts=10, error_threshold=0.01):
+        """Solve IK with retries and joint limits to ensure stable arm positioning."""
+        
+        # Create a full tensor for all environments
+        full_ee_cmd = self.ik_commands.clone()
+        ee_cmd = torch.zeros((len(env_ids), 7), device=self.device)
+        ee_cmd[:, :3] = desired_pos  # Local position
+        ee_cmd[:, 3:7] = desired_quat  # Local orientation
+        
+        # Copy the command for reset environments into the full tensor
+        full_ee_cmd[env_ids, :] = ee_cmd
+        
+        # Prepare full-sized tensors for the IK controller
+        full_ee_pos_local = self.ee_position.clone()
+        full_ee_quat_local = self.ee_orientation.clone()
+        
+        # Define reasonable joint movement limits per iteration
+        MAX_DELTA_PER_JOINT = torch.tensor([0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.35], device=self.device)
+        
+        for attempt in range(max_attempts):
+            # Generate a new starting configuration for new attempts
+            if attempt > 0:
+                joint_pos = self._robot.data.default_joint_pos[env_ids] + sample_uniform(
+                    -0.05,
+                    0.05,
+                    (len(env_ids), self._robot.num_joints),
+                    self.device,
+                )
+                joint_pos = torch.clamp(joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
+                joint_vel = torch.zeros_like(joint_pos)
+                self._robot.set_joint_position_target(joint_pos, env_ids=env_ids)
+                self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+                
+                # Update simulation
+                self.scene.write_data_to_sim()
+                self.sim.step(render=False)
+                self.scene.update(dt=self.physics_dt)
+            
+            # Reset controller
+            self.diff_ik_controller.reset(env_ids=env_ids)
+            self.diff_ik_controller.set_command(full_ee_cmd)
+            
+            # Store the initial joint positions for this attempt
+            initial_joint_positions = self._robot.data.joint_pos[env_ids][:, self.robot_entity_cfg.joint_ids].clone()
+            
+            # Track best position error and joint positions
+            best_mean_error = float('inf')
+            best_joint_positions = None
+            
+            for i in range(max_iterations):
+                # Get current robot state 
+                full_joint_positions = self._robot.data.joint_pos[:, self.robot_entity_cfg.joint_ids]
+                joint_positions_current = full_joint_positions[env_ids]
+                
+                # Get current end effector position/orientation
+                ee_pose_w_current = self._robot.data.body_state_w[env_ids, self.robot_entity_cfg.body_ids[0], 0:7]
+                root_states_current = self._robot.data.root_state_w[env_ids]
+                
+                # Convert to local coordinates
+                ee_pos_local_current, ee_quat_local_current = subtract_frame_transforms(
+                    root_states_current[:, 0:3], root_states_current[:, 3:7], 
+                    ee_pose_w_current[:, 0:3], ee_pose_w_current[:, 3:7]
+                )
+                
+                # Update tensors for resetting environments
+                full_ee_pos_local[env_ids] = ee_pos_local_current
+                full_ee_quat_local[env_ids] = ee_quat_local_current
+                
+                # Get jacobian
+                jacobian_current = self._robot.root_physx_view.get_jacobians()[:, self.ee_jacobi_idx, :, self.robot_entity_cfg.joint_ids]
+                
+                # Compute IK for all environments
+                full_target_joint_positions = self.diff_ik_controller.compute(
+                    full_ee_pos_local, full_ee_quat_local, jacobian_current, full_joint_positions
+                )
+                
+                # Extract joint positions for reset environments
+                target_joint_positions = full_target_joint_positions[env_ids]
+                
+                # ===== Apply joint movement limits =====
+                # Calculate joint deltas
+                joint_deltas = torch.abs(target_joint_positions - joint_positions_current)
+                
+                # Check if any joint is moving too much
+                joint_exceeds_limit = joint_deltas > MAX_DELTA_PER_JOINT
+                
+                # Scale down movements that exceed limits
+                if joint_exceeds_limit.any():
+                    # Find the scaling needed for each joint
+                    scale_factors = torch.ones_like(joint_deltas)
+                    mask = joint_exceeds_limit
+                    scale_factors[mask] = MAX_DELTA_PER_JOINT.repeat(len(env_ids), 1)[mask] / joint_deltas[mask]
+                    
+                    # Find minimum scale factor per environment
+                    min_scale_per_env, _ = torch.min(scale_factors, dim=1)
+                    
+                    # Apply scaling to keep movement proportional
+                    for env_idx in range(len(env_ids)):
+                        if min_scale_per_env[env_idx] < 1.0:
+                            # Scale the movements to maintain direction but limit magnitude
+                            env_delta = target_joint_positions[env_idx] - joint_positions_current[env_idx]
+                            scaled_delta = env_delta * min_scale_per_env[env_idx]
+                            target_joint_positions[env_idx] = joint_positions_current[env_idx] + scaled_delta
+                
+                # Limit total movement from initial position (avoid joint flips)
+                total_movement = torch.abs(target_joint_positions - initial_joint_positions)
+                max_total_movement = MAX_DELTA_PER_JOINT * 5  # Allow 5x the per-step limit for total movement
+                
+                exceeds_total = total_movement > max_total_movement
+                if exceeds_total.any():
+                    # Scale down total movements that exceed limits
+                    total_scale_factors = torch.ones_like(total_movement)
+                    total_scale_factors[exceeds_total] = max_total_movement.repeat(len(env_ids), 1)[exceeds_total] / total_movement[exceeds_total]
+                    
+                    # Find minimum scale factor per environment
+                    min_total_scale, _ = torch.min(total_scale_factors, dim=1)
+                    
+                    # Apply total movement scaling
+                    for env_idx in range(len(env_ids)):
+                        if min_total_scale[env_idx] < 1.0:
+                            # Scale the total movement
+                            total_delta = target_joint_positions[env_idx] - initial_joint_positions[env_idx]
+                            scaled_total = total_delta * min_total_scale[env_idx]
+                            target_joint_positions[env_idx] = initial_joint_positions[env_idx] + scaled_total
+                
+                # Apply joint limits
+                target_joint_positions = torch.clamp(
+                    target_joint_positions, 
+                    self.robot_dof_lower_limits[self.robot_entity_cfg.joint_ids],
+                    self.robot_dof_upper_limits[self.robot_entity_cfg.joint_ids]
+                )
+                
+                # Apply the joint positions to the robot
+                self._robot.set_joint_position_target(target_joint_positions, joint_ids=self.robot_entity_cfg.joint_ids, env_ids=env_ids)
+                self._robot.write_joint_state_to_sim(target_joint_positions, torch.zeros_like(target_joint_positions), env_ids=env_ids)
+                
+                # Update simulation
+                self.scene.write_data_to_sim()
+                self.sim.step(render=False)
+                self.scene.update(dt=self.physics_dt)
+                
+                # Calculate error
+                current_ee_pose = self._robot.data.body_state_w[env_ids, self.robot_entity_cfg.body_ids[0], 0:3] - self.scene.env_origins[env_ids]
+                current_ee_pose[:, 2] -= 1.05  # Adjust for table height
+                current_error = torch.norm(current_ee_pose - desired_pos, dim=-1)
+                mean_error = current_error.mean().item()
+                
+                # Track best solution
+                if mean_error < best_mean_error:
+                    best_mean_error = mean_error
+                    best_joint_positions = target_joint_positions.clone()
+                
+                # if i % 5 == 0 or mean_error < error_threshold:
+                #     print(f"Iteration {i}: Average position error = {mean_error:.4f}")
+                
+                # Check if error threshold reached
+                if mean_error < error_threshold:
+                    print(f"✓ Reached target error threshold ({error_threshold}) after {i+1} iterations!")
+                    return True
+            
+            # If we didn't converge but have a decent best solution, use that
+            if best_joint_positions is not None and best_mean_error < error_threshold * 3:
+                print(f"Using best solution with error {best_mean_error:.4f}")
+                self._robot.set_joint_position_target(best_joint_positions, joint_ids=self.robot_entity_cfg.joint_ids, env_ids=env_ids)
+                self._robot.write_joint_state_to_sim(best_joint_positions, torch.zeros_like(best_joint_positions), env_ids=env_ids)
+                self.scene.write_data_to_sim()
+                self.sim.step(render=False)
+                print(joint_positions_current)
+                return best_mean_error < error_threshold * 2
+        
+        print(f"✗✗ Failed to reach target position after {max_attempts} attempts")
+        return False
+
+    def _compute_spawn_point(self, env_ids: torch.Tensor) -> torch.Tensor:
+        # Compute the vector from the target to the object mean.
+        v = self.objects_pos_mean[env_ids] - self.target_pos[env_ids]
+        # Normalize v to obtain a unit vector.
+        v_hat = v / torch.norm(v, p=2, dim=-1, keepdim=True)
+        # Compute the desired point on the spawn volume's edge.
+        pos = self.objects_pos_mean[env_ids] - self.scene.env_origins[env_ids] + (1.1*self.cfg.spawn_area_radius) * v_hat
+
+        # calcuate start quaternion to point away from the target
+        theta_desired = torch.arctan2(v_hat[:,1], v_hat[:,0])
+        theta_current = self.quaternion_to_yaw(self.init_ee_orientation[env_ids])
+        delta_theta = theta_current - theta_desired
+        q_z = self.z_rotation_quaternion(delta_theta)
+        q_new = quat_mul(self.init_ee_orientation[env_ids], q_z) 
+        
+        return pos, q_new
+
+    def _get_observations(self):
+        """
+        OBSERVATIONS:
+            1. End point of pusher position relative to the target position
+            2. yaw of the end-effector in radians
+            3. Each object position relative to the target position
+        """
+
+        # with Timer("_get_observations", verbose=True):
+        # Delete the z axis of positions
+        robot_grasp_pos_temp = self.robot_grasp_pos[:,:2]
+        target_pos_temp = self.target_pos[:,:2]
+        objects_pos_temp = self.objects_pos[:,:,:2]
+
+        robot_grasp_pos_rel = robot_grasp_pos_temp - target_pos_temp
+
+        # Convert the end-effector orientation to only the yaw angle
+        ee_yaw = self.quaternion_to_yaw(self.ee_orientation)
+    
+        objects_pos_rel = objects_pos_temp - target_pos_temp.unsqueeze(1)
+
+        ####################################
+        # PERMUTE THE OBJECTS OBSERVATIONS #
+        ####################################
+        
+        # num_envs, num_objects, _ = objects_pos_rel.shape
+
+        # # Create a random tensor to generate permutation indices for each environment
+        # rand_tensor = torch.rand(num_envs, num_objects, device=objects_pos_rel.device)
+        # perm_indices = torch.argsort(rand_tensor, dim=1)
+
+        # # Use gather to apply the permutation along the objects dimension
+        # objects_pos_rel = objects_pos_rel.gather(1, perm_indices.unsqueeze(-1).expand(-1, -1, 2))
+                
+        ####################################
+
+        objects_pos_rel_reshaped = objects_pos_rel.reshape(self.num_envs, -1)
+
+        observations = torch.cat(
+            (
+                robot_grasp_pos_rel,            # [x, y]                        in world frame
+                ee_yaw.unsqueeze(1),            # [yaw_rad]                     in world frame
+                objects_pos_rel_reshaped,       # [x, y] x env objects          in world frame
+            ),  
+            dim=-1,
+        )
+
+        return {"policy": observations} #{"policy": torch.clamp(observations, -5.0, 5.0)}
+    
+    def _compute_intermediate_values(self, env_ids: torch.Tensor | None = None):
+        if env_ids is None:
+            env_ids = self._robot._ALL_INDICES
+
+        # Get the hand's global position and rotation
+        hand_pos = self._robot.data.body_pos_w[env_ids, self.hand_link_idx]
+        hand_rot = self._robot.data.body_quat_w[env_ids, self.hand_link_idx]
+
+        # data for object
+        self.objects_pos[env_ids] = self._object_collection.data.object_pos_w[env_ids] # shape (num_envs, num_grans, 3)
+        self.objects_pos_mean[env_ids] = torch.mean(self.objects_pos[env_ids], dim=1, keepdim=True).squeeze(1) # shape (num_envs, 3)
+
+        # Visualize the mean object position
+        self.mean_marker.visualize(self.objects_pos_mean[env_ids], self.all_env_unit_quat[env_ids])
+
+        # data for robot
+        (
+            self.robot_grasp_rot[env_ids], # end effector rotation in world frame
+            self.robot_grasp_pos[env_ids], # end effector position in world frame
+        ) = self._compute_grasp_transforms(
+            hand_rot,
+            hand_pos,
+            self.robot_local_grasp_rot[env_ids],
+            self.robot_local_grasp_pos[env_ids],
+        )
+
+    def _compute_rewards(
+        self,
+        objects_pos,
+        objects_pos_mean,
+        target_pos,
+        robot_grasp_pos,
+        spawn_distance,
+        actions,
+        target_reward_scale,
+        action_penalty_scale,
+        dist_reward_scale,
+        direction_penalty_scale,
+    ):
+
+        ### Rewards for granules
+        ## Calculate object movement from previous positions
+        object_movement = torch.norm(objects_pos - self.prev_objects_pos, p=2, dim=-1)  # shape (num_envs, num_grans)
+        is_moving = object_movement > self.min_movement_threshold
+        
+        # Calculate current and previous distance to target for each object
+        curr_goal_dist = torch.norm(objects_pos - target_pos.unsqueeze(1), p=2, dim=-1)  # shape (num_envs, num_grans)
+        prev_goal_dist = torch.norm(self.prev_objects_pos - target_pos.unsqueeze(1), p=2, dim=-1)  # shape (num_envs, num_grans)
+        
+        # Calculate if objects are moving toward or away from target
+        # Negative values mean objects are moving toward the target
+        dist_change = curr_goal_dist - prev_goal_dist
+        
+        # Identify objects moving in wrong direction (positive dist_change = moving away from target)
+        moving_wrong_direction = (dist_change > 0) & is_moving
+        
+        # Make anywhere in the target area optimal
+        in_target = curr_goal_dist < self.cfg.goal_diameter/2
+        curr_goal_dist = torch.where(in_target, self.zero_tensor, curr_goal_dist)
+        
+        # Calculate normalized goal distance reward
+        norm_goal_dist = 1 - torch.div(curr_goal_dist, spawn_distance)
+        norm_goal_dist = torch.where(norm_goal_dist < 0.0, self.zero_tensor, norm_goal_dist)
+        
+        # Zero out positive rewards for objects moving in the wrong direction
+        # Only consider objects that are moving and not already in target
+        norm_goal_dist = torch.where(
+            moving_wrong_direction,               # Wrong direction
+            self.zero_tensor,                     # Zero reward
+            norm_goal_dist                        # Keep original reward
+        )
+        
+        # Only apply rewards to moving objects or objects in target
+        norm_goal_dist = torch.where(is_moving & ~in_target, norm_goal_dist, 0.0)
+        
+        # Apply penalty for objects moving away from target (not in target area)
+        direction_penalty = torch.where(
+            moving_wrong_direction & ~in_target,
+            - torch.ones_like(dist_change),  # Fixed penalty value
+            self.zero_tensor
+        )
+        
+        # Sum rewards across all objects and normalize
+        norm_goal_dist_sum = torch.sum(norm_goal_dist, dim=-1)
+        direction_penalty_sum = torch.sum(direction_penalty, dim=-1)
+        
+        # Normalize by number of objects
+        norm_reward = norm_goal_dist_sum / self.cfg.num_grans
+        direction_penalty_norm = direction_penalty_sum / self.cfg.num_grans
+        
+        # Save current positions for next step
+        self.prev_objects_pos = objects_pos.clone()
+
+        # Action penalty
+        action_penalty = torch.norm(actions**2, p=2, dim=-1)
+        
+
+        #### Rewards for EE being close to each object
+        d = torch.norm(objects_pos - robot_grasp_pos.unsqueeze(1), p=2, dim=-1)  # shape [num_envs, num_grans]
+        d = d * ~in_target  # Ignore objects already in target area
+        normalized_d = 1.0 / (1.0 + (d/0.2)**2)  # Apply 1/(1+(x/0.2)^2) to each distance
+        normalized_d = normalized_d * normalized_d
+        normalized_d = torch.where(d <= 0.1, normalized_d * 4, normalized_d)
+        # normalized_d = normalized_d * ~in_target  # Ignore objects already in target area
+        dist_reward = normalized_d.sum(dim=-1)  # shape [num_envs]
+        dist_reward = dist_reward / ((~in_target).sum())  # Normalize by number of objects
+
+        # Total reward
+        rewards = (
+                  target_reward_scale * norm_reward 
+                + direction_penalty_scale * direction_penalty_norm 
+                + dist_reward_scale * dist_reward
+                - action_penalty_scale * action_penalty
+        )
+
+        rewards = rewards + (1/self.cfg.num_grans)*in_target.sum(dim=-1)  # Add reward for each object in target area
+        
+        self.episode_reward_sum += rewards
+
+        self.extras["log"] = {
+            "episode_reward_sum": (self.episode_reward_sum).mean(),
+            "Objects_in_target": (in_target.sum(dim=-1).float()).mean(),
+        }
+
+        # print(
+        #       f"---"
+        #       f"\ngoal_dist_rew: {norm_reward[0]}"
+        #       f"\ndir_penalty  : {direction_penalty_scale * direction_penalty_norm[0]}"
+        #       f"\ndist_to_obj  : {dist_reward_scale * dist_reward[0]}"
+        #       f"\naction_pen   : {action_penalty_scale * action_penalty[0]}"
+        #       f"\nstep rewards : {rewards[0]}"
+        #       f"\nsum rewards  : {self.episode_reward_sum[0]}"
+        #     )
+        
+        return rewards
+
+    def _compute_grasp_transforms(
+        self,
+        hand_rot,
+        hand_pos,
+        franka_local_grasp_rot,
+        franka_local_grasp_pos,
+    ):
+        global_franka_rot, global_franka_pos = tf_combine(
+            hand_rot, hand_pos, franka_local_grasp_rot, franka_local_grasp_pos
+        )
+
+        return global_franka_rot, global_franka_pos

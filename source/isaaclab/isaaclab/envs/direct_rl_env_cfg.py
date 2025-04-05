@@ -225,3 +225,9 @@ class DirectRLEnvCfg:
 
     wait_for_textures: bool = True
     """True to wait for assets to be loaded completely, False otherwise. Defaults to True."""
+
+    observation_dir: str = ""  # Default empty string
+
+    repeat_actions: int = 1  # Number of times to repeat the same action before sending a new action to the environment
+
+    obs_chunk: int = 1  # Number of chunks to process objects for grid building

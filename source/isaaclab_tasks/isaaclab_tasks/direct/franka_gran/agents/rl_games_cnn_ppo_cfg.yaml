@@ -1,0 +1,138 @@
+params:
+  seed: 42
+
+  repeat_actions: 4
+  obs_chunk: 10
+
+  # environment wrapper clipping
+  env:
+    clip_actions: 1.0
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    require_rewards: False
+    require_last_actions: False
+    separate: False
+    value_shape: 1
+
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+
+    cnn:
+      type: conv2d
+      activation: relu
+      permute_input: False
+      initializer:
+        name: orthogonal_initializer
+        gain: 1.41421356237 
+      convs:    
+        # # for 128x128 input
+        # - filters: 32
+        #   kernel_size: 8
+        #   strides: 4
+        #   padding: 0     # Output: 31×31
+        # - filters: 64
+        #   kernel_size: 4
+        #   strides: 2
+        #   padding: 0     # Output: 14×14
+        # - filters: 128
+        #   kernel_size: 3
+        #   strides: 2
+        #   padding: 0     # Output: 6×6
+        # - filters: 128
+        #   kernel_size: 3
+        #   strides: 1
+        #   padding: 0     # Output: 4×4
+   
+        # Optimized for 96×96 input
+        - filters: 32
+          kernel_size: 7
+          strides: 3
+          padding: 1     # Output: 31×31
+        - filters: 64
+          kernel_size: 5
+          strides: 2
+          padding: 1     # Output: 15×15 
+        - filters: 128
+          kernel_size: 3
+          strides: 2
+          padding: 0     # Output: 7×7
+        - filters: 256
+          kernel_size: 3
+          strides: 1
+          padding: 0     # Output: 5×5
+
+        # # for 64x64 input
+        # - filters: 32
+        #   kernel_size: 8
+        #   strides: 4
+        #   padding: 0     # Output: 15×15
+        # - filters: 64
+        #   kernel_size: 4
+        #   strides: 2
+        #   padding: 0     # Output: 6×6
+        # - filters: 64
+        #   kernel_size: 3
+        #   strides: 1
+        #   padding: 0     # Output: 4×4
+      
+    mlp:
+      units: [512]
+      activation: relu
+      initializer:
+        name: orthogonal_initializer
+        gain: 1.41421356237
+
+  load_checkpoint: False # flag which sets whether to load the checkpoint
+  load_path: '' # path to the checkpoint to load
+
+  config:
+    name: franka_gran
+    env_name: rlgpu
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    ppo: True
+    mixed_precision: False
+    normalize_input: True
+    normalize_value: True
+    # value_bootstrap: True
+    num_actors: -1  # configured from the script (based on num_envs)
+    reward_shaper:
+      scale_value: 0.01
+    normalize_advantage: True
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 3e-4 # 5e-4
+    lr_schedule: adaptive
+    kl_threshold: 0.000  # 0.008
+    score_to_win: 100000000
+    max_epochs: 1000000
+    save_best_after: 50
+    save_frequency: 100
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 16        # Fine to start, but could be increased to 32-64
+    minibatch_size: 2048 #1792  #8192  # Very small, consider increasing to 64-128
+    mini_epochs: 8
+    critic_coef: 4
+    clip_value: True
+    seq_length: 4
+    bounds_loss_coef: 0.0001

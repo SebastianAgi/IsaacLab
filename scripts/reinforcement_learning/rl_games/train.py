@@ -27,6 +27,11 @@ parser.add_argument("--checkpoint", type=str, default=None, help="Path to model 
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 
+# wandb arguments
+parser.add_argument("--track", type=str, default=True, help="record run.")
+parser.add_argument("--wandb-project-name", type=str, default="rl_games", help="the wandb's project name")
+parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
+
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -167,6 +172,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # reset the agent and env
     runner.reset()
+
+    # Add wandb support
+    if args_cli.track:
+        import wandb
+        wandb.init(
+            project=args_cli.task,
+            entity=args_cli.wandb_entity,
+            sync_tensorboard=True,
+            config=agent_cfg,
+            monitor_gym=True,
+            save_code=True,
+            name=str(env_cfg.scene.num_envs) + "Envs-" + str(env_cfg.num_grans) + "Grans",
+        )
+
     # train the agent
     if args_cli.checkpoint is not None:
         runner.run({"train": True, "play": False, "sigma": train_sigma, "checkpoint": resume_path})
