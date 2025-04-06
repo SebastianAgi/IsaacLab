@@ -26,7 +26,7 @@ import os
 
 
 class FrankaGran2D3DOFGrid(DirectRLEnv):
-    """RL Environment where the action space is the end-effector pose (position + orientation)."""
+    """RL Environment where the action space is the end-effector position (X,Y) and yaw."""
 
     # pre-physics step calls
     #   |-- _pre_physics_step(action)

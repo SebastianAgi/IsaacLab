@@ -74,30 +74,48 @@ def target_layer(target_pos: torch.Tensor, target_radius: float, xy_world: torch
     dist_sq = diff[..., 0] ** 2 + diff[..., 1] ** 2
     target_mask = dist_sq <= (target_radius ** 2)
     
+    # # Expand the mask to include neighboring pixels
+    # target_mask = torch.nn.functional.max_pool2d(target_mask.unsqueeze(1).float(), kernel_size=3, stride=1, padding=1).squeeze(1).to(torch.bool)
+    
     return target_mask
 
 @torch.jit.script
-def EE_layer(ee_pos: torch.Tensor, ee_orient: torch.Tensor, xy_world: torch.Tensor, end_effector_length: float, end_effector_width: float) -> torch.Tensor:
-    """Generate a end effector mask."""
-    # -----------------------------------
-    # Channel 1: End-effector as oriented rectangle (vectorized)
-    # -----------------------------------
+def EE_layer(
+    ee_pos: torch.Tensor, 
+    ee_orient: torch.Tensor, 
+    xy_world: torch.Tensor, 
+    end_effector_length: float, 
+    end_effector_width: float,
+    x_margin: float,  # assuming square cells for simplicity
+    y_margin: float
+) -> torch.Tensor:
+    """Generate an end effector mask with inflated boundaries."""
+    # Calculate differences and rotate into the end effector frame.
     ee_diff = xy_world.unsqueeze(0) - ee_pos  # shape: (num_envs, H, W, 2)
     cos_theta = torch.cos(ee_orient)
     sin_theta = torch.sin(ee_orient)
     x_local = cos_theta * ee_diff[..., 0] + sin_theta * ee_diff[..., 1]
     y_local = -sin_theta * ee_diff[..., 0] + cos_theta * ee_diff[..., 1]
-    half_length = end_effector_length / 2
-    half_width = end_effector_width / 2
-    ee_mask = (x_local >= -half_length) & (x_local <= half_length) & \
-              (y_local >= -half_width)  & (y_local <= half_width)
+    
+    half_length = end_effector_length / 2.0
+    half_width  = end_effector_width / 2.0
+    # Inflate boundaries by half the grid cell size.
+    
+    ee_mask = (x_local >= -(half_length + x_margin)) & (x_local <= (half_length + x_margin)) & \
+              (y_local >= -(half_width  + y_margin)) & (y_local <= (half_width  + y_margin))
 
     return ee_mask
 
+
 @torch.jit.script
-def object_layer(obj_mask: torch.Tensor, obj_pos_chunk: torch.Tensor, 
-                obj_orient_chunk: torch.Tensor, coords: torch.Tensor, 
-                object_size: float) -> torch.Tensor:  # <-- Changed to float
+def object_layer(obj_mask: torch.Tensor, 
+                 obj_pos_chunk: torch.Tensor, 
+                 obj_orient_chunk: torch.Tensor, 
+                 coords: torch.Tensor, 
+                 object_size: float,
+                 x_margin: float,
+                 y_margin: float
+                ) -> torch.Tensor:  # <-- Changed to float
     """Generate a mask for a single object."""
     # -----------------------------------
     # Channel 2: Objects (vectorized)
@@ -113,11 +131,15 @@ def object_layer(obj_mask: torch.Tensor, obj_pos_chunk: torch.Tensor,
     y_local = -sin_theta_chunk * dx + cos_theta_chunk * dy
     
     half_side = object_size / 2
-    inside = (x_local >= -half_side) & (x_local <= half_side) & \
-                (y_local >= -half_side) & (y_local <= half_side)
+    inside = (x_local >= -(half_side + x_margin)) & (x_local <= (half_side + x_margin)) & \
+                (y_local >= -(half_side + y_margin)) & (y_local <= (half_side + y_margin))
     # Reduce over objects in the chunk (logical OR across the object dimension).
     inside_any = inside.any(dim=1)
     obj_mask |= inside_any
+    
+    # # Expand the mask to include neighboring pixels
+    # expanded_inside_any = torch.nn.functional.max_pool2d(inside_any.unsqueeze(1).float(), kernel_size=3, stride=1, padding=1).squeeze(1).to(torch.bool)
+    # obj_mask |= expanded_inside_any
 
     return obj_mask
 
@@ -189,6 +211,9 @@ class GridObservationGenerator:
         # Store world coordinates.
         self.x_world = x_grid * x_pixel_size  # shape (H, W)
         self.y_world = y_grid * y_pixel_size  # shape (H, W)
+
+        self.x_margin = x_pixel_size / 2.0
+        self.y_margin = y_pixel_size / 2.0
         
     def generate_observations(
         self, 
@@ -227,7 +252,7 @@ class GridObservationGenerator:
         # Layer 1: End-effector
         ee_pos = end_effector_position.view(num_envs, 1, 1, 2)
         ee_orient = end_effector_orientation.view(num_envs, 1, 1)
-        observations[:, 1] = EE_layer(ee_pos, ee_orient, xy_world, end_effector_length, end_effector_width)
+        observations[:, 1] = EE_layer(ee_pos, ee_orient, xy_world, end_effector_length, end_effector_width, self.x_margin, self.y_margin)
         
         # Layer 2: Objects (process objects in chunks to limit broadcast size)
         # Instead of broadcasting over all objects at once, process them in smaller chunks.
@@ -246,7 +271,7 @@ class GridObservationGenerator:
             # Reshape grid coordinates for broadcasting: (1, 1, H, W, 2)
             coords = xy_world.view(1, 1, H, W, 2)
             
-            obj_mask = object_layer(obj_mask, obj_pos_chunk, obj_orient_chunk, coords, object_size)
+            obj_mask = object_layer(obj_mask, obj_pos_chunk, obj_orient_chunk, coords, object_size, self.x_margin, self.y_margin)
         
         observations[:, 2] = obj_mask
         
@@ -256,11 +281,11 @@ class GridObservationGenerator:
 
 if __name__ == "__main__":
     # Initialize the generator.
-    grid_gen = GridObservationGenerator(grid_shape=(96,96), area=(0.65, 0.75), dtype=torch.float16)
+    grid_gen = GridObservationGenerator(grid_shape=(16,16), area=(0.65, 0.75), dtype=torch.float16)
     
     # Test with 400 environments and 10 objects each.
     num_envs = 4096
-    num_obj = 10
+    num_obj = 4
     obj_pos = torch.rand((num_envs, num_obj, 2), device='cuda') * 0.65
     obj_pos[:, 0, :] = torch.tensor([0.65/2, 0.75/2])
     obj_quat = torch.rand((num_envs, num_obj, 4), device='cuda')
@@ -278,7 +303,7 @@ if __name__ == "__main__":
     print("obj_yaw shape:", obj_yaw.shape)
     
     # Warm up TorchScript (first call compiles the function).
-    for _ in range(50):
+    for _ in range(10):
         with Timer("Grid generation"):
             obs = grid_gen.generate_observations(obj_pos, 
                                                  target_area, 
@@ -290,13 +315,13 @@ if __name__ == "__main__":
 
     print(torch.unique(obs[0]))
     
-    for i in range(1):
+    for i in range(10):
         mask1 = obs[i]
         print(mask1.shape)
         mask1 = mask1.sum(dim=0)
+        # mask1 = mask1[2]
         plt.imshow(mask1.cpu().numpy(), cmap='hot')
         plt.axis('off')
         plt.tight_layout()
         # plt.savefig(f'cube_mask_{i}.png', bbox_inches='tight', pad_inches=0)
         plt.show()
-        # plt.waitforbuttonpress()
