@@ -26,7 +26,7 @@ import os
 
 
 class FrankaGran2D3DOFGrid(DirectRLEnv):
-    """RL Environment where the action space is the end-effector position (X,Y) and yaw."""
+    """RL Environment where the action space is the end-effector pose (position + orientation)."""
 
     # pre-physics step calls
     #   |-- _pre_physics_step(action)
@@ -695,7 +695,7 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
         robot_grasp_pos = robot_grasp_pos[:,:2]
 
         ### Rewards for granules
-        # Calculate current and previous distance to target for each object
+        # Calculate current distance to target for each object
         curr_goal_dist = torch.norm(objects_pos - target_pos.unsqueeze(1), p=2, dim=-1)  # shape (num_envs, num_grans)
         
         in_target = curr_goal_dist < self.cfg.goal_diameter/2
@@ -723,8 +723,7 @@ class FrankaGran2D3DOFGrid(DirectRLEnv):
 
         # Total reward
         rewards = (
-                  - curr_goal_dist.sum() 
-                #   target_reward_scale * norm_reward 
+                  target_reward_scale * norm_reward 
                 # + dist_reward_scale * dist_reward
         )
 

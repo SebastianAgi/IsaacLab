@@ -119,6 +119,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs
     log_dir = agent_cfg["params"]["config"].get("full_experiment_name", datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    
+    ## Seb added this
+    # create directory for logging observations
+    observation_dir = os.path.join(log_root_path, log_dir, "observations")
+    env_cfg.observation_dir = observation_dir
+    env_cfg.repeat_actions = agent_cfg["params"]["repeat_actions"]
+    env_cfg.obs_chunk = agent_cfg["params"]["obs_chunk"]
+    
     # set directory into agent config
     # logging directory path: <train_dir>/<full_experiment_name>
     agent_cfg["params"]["config"]["train_dir"] = log_root_path

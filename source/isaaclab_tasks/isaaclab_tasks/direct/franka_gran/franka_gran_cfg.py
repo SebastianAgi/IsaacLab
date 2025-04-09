@@ -25,7 +25,7 @@ class FrankaGranCfg(DirectRLEnvCfg):
     num_grans = 10
 
     # Environment configuration
-    episode_length_s = 100# 8=480, 12=720. 16=960, 50=3000 timesteps    timesteps = episode_length_s / (decimation * dt)
+    episode_length_s = 16# 8=480, 12=720. 16=960, 50=3000 timesteps    timesteps = episode_length_s / (decimation * dt)
     decimation = 4
     action_space = 3
     state_space = 0
@@ -35,11 +35,11 @@ class FrankaGranCfg(DirectRLEnvCfg):
     # # Observation space for 2D 3DOF environment (target != origin)
     # observation_space = 5 + (2*num_grans)
 
-    # Observation space for 2D environment 3DOF env (target = origin)
+    # # Observation space for 2D environment 3DOF env (target = origin)
     # observation_space = 3 + (2*num_grans)
 
     # Observation space for image based observation
-    observation_space = [3, 64,64] # RGB image
+    observation_space = [3, 48, 48] # RGB image
 
     # Simulation configuration
     # simulation
@@ -67,19 +67,20 @@ class FrankaGranCfg(DirectRLEnvCfg):
     spawn_area_radius = 0.05
 
     # Spawn/target area configuration
-    spawn_pose = [0.25, 0.19, 1.07]
-    target_pose = [0.5, -goal_radius, 1.07]
+    spawn_pose = [0.25, 0.19, 1.05]
+    target_pose = [0.4, 0.0, 1.04]
     full_table = [[0.075, -0.375, 1.05], [0.725, 0.375, 1.05]]
     spawn_area = [[0.075, 0.0, 1.05], [0.725, 0.375, 1.05]] # smallest corner and largest corner
     target_area = [[0.075, 0.0, 1.04], [0.725, -0.375, 1.04]] # smallest corner and largest corner
 
+    spawn_area = full_table
+    
     # Create common spawn point for granules objects
-    init_spawn_point = [0.375, goal_radius, 1.07]
+    init_spawn_point = [0.375, 0.3, 1.07]
 
     action_scale = 1.0 #7.5
     dof_velocity_scale = 0.1
     object_scale = 0.01
-
 
     # Reward scales
     dist_reward_scale = 0.005

@@ -391,6 +391,37 @@ class DirectRLEnv(gym.Env):
         # return observations, rewards, resets and extras
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
+
+    def step_physics_only(self, start_pose: torch.Tensor) -> None:
+        """
+        Steps through the physics simulation for the given start_pose without computing
+        rewards, observations, or handling resets.
+
+        Args:
+            start_pose: A tensor of shape (num_envs, action_dim) with the actions to apply.
+        """
+        # Move start_pose to device and optionally apply start_pose noise if configured.
+        start_pose = start_pose.to(self.device)
+        if self.cfg.action_noise_model:
+            start_pose = self._action_noise_model.apply(start_pose)
+
+        # Pre-process actions before physics stepping.
+        self._pre_physics_step_through(start_pose)
+        
+        # Check if rendering is enabled.
+        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+
+        # Loop over the decimation steps.
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            self._apply_action()
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+                self.sim.render()
+            self.scene.update(dt=self.physics_dt)
+
+
     @staticmethod
     def seed(seed: int = -1) -> int:
         """Set the seed for the environment.
@@ -619,6 +650,17 @@ class DirectRLEnv(gym.Env):
             actions: The actions to apply on the environment. Shape is (num_envs, action_dim).
         """
         raise NotImplementedError(f"Please implement the '_pre_physics_step' method for {self.__class__.__name__}.")
+
+    @abstractmethod
+    def _pre_physics_step_through(self, start_pose: torch.Tensor):
+        """Pre-process actions before stepping through the physics.
+
+        This function is called when you want to step through n number of steps to set the arm in a certain 
+        position. This is useful for setting the arm in a certain position before starting the episode.
+
+        Args:
+            actions: The actions to apply on the environment. Shape is (num_envs, action_dim).
+        """
 
     @abstractmethod
     def _apply_action(self):

@@ -22,6 +22,7 @@ from .franka_gran_2D_3DOF_new_reset import FrankaGran2D3DOFNewReset
 from .franka_gran_2D_3DOF_reset_2 import FrankaGran2D3DOFReset2
 from .franka_gran_2D_3DOF_grid import FrankaGran2D3DOFGrid
 from .franka_gran_2D_3DOF_grid_no_reset import FrankaGran2D3DOFGridContinuing
+from .franka_gran_2D_3DOF_grid_2 import FrankaGran2D3DOFGrid2
 
 ##
 # Register Gym environments.
@@ -75,6 +76,19 @@ gym.register(
     },
 )
 
+# Env config for placing gripper close to objects and also doing an initial action forcing of pushing 
+# from the spawn location to target (did not work well)
+gym.register(
+    id="Isaac-Franka-Granular-Spawn-Close-v2",
+    entry_point=f"{__name__}.franka_gran_spawn_close2:FrankaGranSpawnClose2",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.franka_gran_spawn_close:FrankaGranCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaPushObjectsPPORunnerCfg",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+)
 
 # Env config with action space of 2D and 3DOF movement ony on x,y axis
 # Rewards here are objects distance to target and penalty for wrong direction
@@ -252,15 +266,13 @@ gym.register(
 )
 
 
-# Env config for placing gripper close to objects and also doing an initial action forcing of pushing 
-# from the spawn location to target (did not work well)
 gym.register(
-    id="Isaac-Franka-Granular-Spawn-Close-v2",
-    entry_point=f"{__name__}.franka_gran_spawn_close2:FrankaGranSpawnClose2",
+    id="Isaac-Franka-Granular-2D-3DOF-GRID-Resnet-v2",
+    entry_point=f"{__name__}.franka_gran_2D_3DOF_grid_2:FrankaGran2D3DOFGrid2",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.franka_gran_spawn_close:FrankaGranCfg",
-        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_resnet_ppo_cfg.yaml",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaPushObjectsPPORunnerCfg",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
     },
