@@ -60,3 +60,6 @@ _build
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
+
+# Generated observations from grid builder
+/grid_observations/
