@@ -228,6 +228,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # train the agent
 
     global_rank = int(os.getenv("RANK", "0"))
+    print(f"[INFO] Global rank of the process: {global_rank}")
     if args_cli.track and global_rank == 0:
         if args_cli.wandb_entity is None:
             raise ValueError("Weights and Biases entity must be specified for tracking.")

@@ -40,11 +40,13 @@ import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, AssetBaseCfg
+from isaaclab.assets.rigid_object.rigid_object_cfg import RigidObjectCfg, RigidObject
 from isaaclab.controllers import OperationalSpaceController, OperationalSpaceControllerCfg
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
     combine_frame_transforms,
@@ -75,23 +77,58 @@ class SceneCfg(InteractiveSceneCfg):
         prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
     )
 
-    # Tilted wall
-    tilted_wall = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/TiltedWall",
-        spawn=sim_utils.CuboidCfg(
-            size=(2.0, 1.5, 0.01),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0), opacity=0.1),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            activate_contact_sensors=True,
+    # mount
+    stand = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/stand",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/Stand/stand_instanceable.usd", scale=(2.0, 2.0, 2.0)
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(0.6 + 0.085, 0.0, 0.3), rot=(0.9238795325, 0.0, -0.3826834324, 0.0)
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(-0.5, 0.0, 0.3)),
+        
+    )
+
+    # table
+    table = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Table",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"/home/Sebastian/isaacsim/standalone_examples/testing/dark_table.usd", 
+            scale=(1.0, 1.0, 1.0),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+                max_depenetration_velocity=1000.0,
+            ),
+            # mass_props=sim_utils.MassPropertiesCfg(mass=1.0, density=500.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+        # physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.0, dynamic_friction=0.0, restitution=0.0),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.3), rot=(0.7071068, 0, 0, 0.7071068)),
+    )
+
+    # object 
+    object = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Object",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.05, 0.05, 0.05),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0), metallic=0.1),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=False,
+                disable_gravity=False,
+                max_depenetration_velocity=1000.0,
+            ),
+            activate_contact_sensors=True,
+            mass_props=sim_utils.MassPropertiesCfg(mass=1.0, density=500.0),
+            physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.0, dynamic_friction=0.0, restitution=0.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 0.5),
+            rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
 
     contact_forces = ContactSensorCfg(
-        prim_path="/World/envs/env_.*/TiltedWall",
+        prim_path="/World/envs/env_.*/Object",
         update_period=0.0,
         history_length=2,
         debug_vis=False,
@@ -103,6 +140,7 @@ class SceneCfg(InteractiveSceneCfg):
     robot.actuators["panda_forearm"].stiffness = 0.0
     robot.actuators["panda_forearm"].damping = 0.0
     robot.spawn.rigid_props.disable_gravity = True
+    robot.init_state.pos=(-0.5, 0.0, 0.3)
 
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
@@ -124,52 +162,78 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     arm_joint_ids = robot.find_joints(arm_joint_names)[0]
 
     # Create the OSC
+    # For debugging: pure Cartesian pose control, no force control.
     osc_cfg = OperationalSpaceControllerCfg(
-        target_types=["pose_abs", "wrench_abs"],
+        target_types=["pose_abs"],
         impedance_mode="variable_kp",
         inertial_dynamics_decoupling=True,
         partial_inertial_dynamics_decoupling=False,
         gravity_compensation=False,
-        motion_damping_ratio_task=1.0,
-        contact_wrench_stiffness_task=[0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
-        motion_control_axes_task=[1, 1, 0, 1, 1, 1],
-        contact_wrench_control_axes_task=[0, 0, 1, 0, 0, 0],
+        motion_damping_ratio_task=2.0,
+        contact_wrench_stiffness_task=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        motion_control_axes_task=[1, 1, 1, 1, 1, 1],
+        contact_wrench_control_axes_task=[0, 0, 0, 0, 0, 0],
         nullspace_control="position",
     )
     osc = OperationalSpaceController(osc_cfg, num_envs=scene.num_envs, device=sim.device)
 
     # Markers
-    frame_marker_cfg = FRAME_MARKER_CFG.copy()
+    frame_marker_cfg = FRAME_MARKER_CFG.copy() # type: ignore[union-attr]
     frame_marker_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
     ee_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_current"))
     goal_marker = VisualizationMarkers(frame_marker_cfg.replace(prim_path="/Visuals/ee_goal"))
 
-    # Define targets for the arm
-    ee_goal_pose_set_tilted_b = torch.tensor(
-        [
-            [0.3, 0.1, 0.3, 0.0, 1.0, 0.0, 0.0],
-            [0.4, -0.3, 0.3, 0.0, 0.92387953, 0.0, 0.38268343],
-            [0.8, 0.0, 0.5, 0.0, 0.92387953, 0.0, 0.38268343],
-        ],
-        device=sim.device,
-    )
-    ee_goal_wrench_set_tilted_task = torch.tensor(
-        [
-            [0.0, 0.0, 10.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 10.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 10.0, 0.0, 0.0, 0.0],
-        ],
-        device=sim.device,
-    )
-    kp_set_task = torch.tensor(
-        [
-            [360.0, 360.0, 360.0, 360.0, 360.0, 360.0],
-            [420.0, 420.0, 420.0, 420.0, 420.0, 420.0],
-            [320.0, 320.0, 320.0, 320.0, 320.0, 320.0],
-        ],
-        device=sim.device,
-    )
-    ee_target_set = torch.cat([ee_goal_pose_set_tilted_b, ee_goal_wrench_set_tilted_task, kp_set_task], dim=-1)
+    # Parameters for the randomized circle-push behavior
+    circle_radius = 0.15  # meters (distance from cube center to start/end points)
+    approach_height = 0.03  # meters above cube for approach
+    push_distance = 0.18  # how far to push through the cube
+    push_force = 2.0  # target force magnitude in Newtons
+
+    # We will control force in the task frame across X/Y (push direction expressed in task frame).
+    # OSC will be configured to regulate both X and Y force components so the push direction
+    # can be arbitrary in the x/y plane without rotating the task frame yaw explicitly.
+
+    # Basic Cartesian stiffness used for the other axes (not the push DOF(s)).
+    # default_kp = torch.tensor([360.0, 360.0, 360.0, 360.0, 360.0, 360.0], device=sim.device)
+    default_kp = torch.tensor([150.0, 150.0, 150.0, 50.0, 50.0, 50.0], device=sim.device)
+
+    num_envs = scene.num_envs
+
+    # Per-env state variables
+    # 0 = go to start point; 1 = push across to end point; 2 = finished (will reset)
+    behavior_state = torch.zeros(num_envs, dtype=torch.int64, device=sim.device)
+
+    # per-env random angles for start point on circle
+    angles = (2 * torch.pi * torch.rand(num_envs, device=sim.device)).to(sim.device)
+
+    # get cube world position (center) from scene object
+    cube = scene["object"]
+    # cube root pos in world frame (will be updated below each loop iteration)
+    cube_pos_w = cube.data.root_pos_w.clone()
+
+    # create default cube spawn pose 
+    default_root_pos = torch.tensor([0.0, 0.0, 0.35], device=sim.device)
+    default_root_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=sim.device)
+    default_root_lin_vel = torch.zeros(3, device=sim.device)
+    default_root_ang_vel = torch.zeros(3, device=sim.device)
+    default_root_pose = torch.cat([default_root_pos, default_root_quat, default_root_lin_vel, default_root_ang_vel], dim=-1)
+    default_root_pose = default_root_pose.repeat(num_envs, 1)
+
+    # start and end positions in world frame (initialized, will be updated after reset)
+    start_pos_w = torch.zeros(num_envs, 3, device=sim.device)
+    end_pos_w = torch.zeros(num_envs, 3, device=sim.device)
+
+    # a convenient helper to get a downward pointing quaternion in world frame
+    # (used so the end effector points downwards). This is a simple preset quaternion
+    # used in this tutorial; you may rotate yaw if you prefer explicit alignment.
+    # shape (num_envs, 4) to match per-env operations in subtract_frame_transforms.
+    quat_down_world = torch.tensor([0.0, 1.0, 0.0, 0.0], device=sim.device).repeat(num_envs, 1)
+
+    # Fixed task frame at the robot root: identity pose in body frame for all envs.
+    # This makes OSC interpret pose_abs commands directly as EE pose in root frame.
+    identity_task_pose_b = torch.tensor(
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], device=sim.device
+    ).repeat(num_envs, 1)
 
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
@@ -199,7 +263,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     current_goal_idx = 0  # Current goal index for the arm
     command = torch.zeros(
         scene.num_envs, osc.action_dim, device=sim.device
-    )  # Generic target command, which can be pose, position, force, etc.
+    )  # Generic target command (here: only pose and gains).
     ee_target_pose_b = torch.zeros(scene.num_envs, 7, device=sim.device)  # Target pose in the body frame
     ee_target_pose_w = torch.zeros(scene.num_envs, 7, device=sim.device)  # Target pose in the world frame (for marker)
 
@@ -210,8 +274,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     count = 0
     # Simulation loop
     while simulation_app.is_running():
-        # reset every 500 steps
-        if count % 500 == 0:
+        # reset every 500 steps or on a high root z (sanity)
+        if count % 500 == 0 or (root_pose_w[:, 2] > 0.5).any():
             # reset joint state to default
             default_joint_pos = robot.data.default_joint_pos.clone()
             default_joint_vel = robot.data.default_joint_vel.clone()
@@ -219,20 +283,60 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             robot.set_joint_effort_target(zero_joint_efforts)  # Set zero torques in the initial step
             robot.write_data_to_sim()
             robot.reset()
+            # reset cube position
+            cube.write_root_state_to_sim(default_root_pose)
+            cube.reset()
             # reset contact sensor
             contact_forces.reset()
-            # reset target pose
+
+            # Re-sample random angles and compute start/end points in world frame per env
+            angles = (2 * torch.pi * torch.rand(num_envs, device=sim.device)).to(sim.device)
+            # update cube world position
+            cube_pos_w = cube.data.root_pos_w.clone()
+            cos_a = torch.cos(angles)
+            sin_a = torch.sin(angles)
+            start_pos_w[:, 0] = cube_pos_w[:, 0] + cos_a * circle_radius
+            start_pos_w[:, 1] = cube_pos_w[:, 1] + sin_a * circle_radius
+            start_pos_w[:, 2] = cube_pos_w[:, 2] + approach_height
+            # opponent point on circle and a bit further to ensure crossing
+            end_pos_w[:, 0] = cube_pos_w[:, 0] - cos_a * circle_radius*2# + push_distance)
+            end_pos_w[:, 1] = cube_pos_w[:, 1] - sin_a * circle_radius*2# + push_distance)
+            end_pos_w[:, 2] = cube_pos_w[:, 2] + approach_height
+
+            # reset target pose: compute pose of start in body frame
             robot.update(sim_dt)
-            _, _, _, ee_pose_b, _, _, _, _, _, _ = update_states(
+            _, _, _, ee_pose_b, _, root_pose_w, _, _, _, _ = update_states(
                 sim, scene, robot, ee_frame_idx, arm_joint_ids, contact_forces
-            )  # at reset, the jacobians are not updated to the latest state
-            command, ee_target_pose_b, ee_target_pose_w, current_goal_idx = update_target(
-                sim, scene, osc, root_pose_w, ee_target_set, current_goal_idx
             )
-            # set the osc command
+
+            # convert start pose from world to body frame
+            start_pose_b_pos, start_pose_b_quat = subtract_frame_transforms(
+                root_pose_w[:, 0:3], root_pose_w[:, 3:7], start_pos_w, quat_down_world
+            )
+            start_pose_b = torch.cat([start_pose_b_pos, start_pose_b_quat], dim=-1)
+
+            # compute end pose in body frame
+            end_pose_b_pos, end_pose_b_quat = subtract_frame_transforms(
+                root_pose_w[:, 0:3], root_pose_w[:, 3:7], end_pos_w, quat_down_world
+            )
+            end_pose_b = torch.cat([end_pose_b_pos, end_pose_b_quat], dim=-1)
+
+            # initialize command to go to the start pose (pure pose control)
+            command = torch.zeros(num_envs, osc.action_dim, device=sim.device)
+            command[:, :7] = start_pose_b
+            # set default kp gains
+            command[:, 7:13] = default_kp.unsqueeze(0).repeat(num_envs, 1)
+
+            # set the osc command directly in body frame with a fixed root task frame
             osc.reset()
-            command, task_frame_pose_b = convert_to_task_frame(osc, command=command, ee_target_pose_b=ee_target_pose_b)
-            osc.set_command(command=command, current_ee_pose_b=ee_pose_b, current_task_frame_pose_b=task_frame_pose_b)
+            osc.set_command(
+                command=command,
+                current_ee_pose_b=ee_pose_b,
+                current_task_frame_pose_b=identity_task_pose_b,
+            )
+
+            # reset behavior state
+            behavior_state[:] = 0
         else:
             # get the updated states
             (
@@ -247,6 +351,58 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 joint_pos,
                 joint_vel,
             ) = update_states(sim, scene, robot, ee_frame_idx, arm_joint_ids, contact_forces)
+
+            # prepare the next command per-env depending on state (pose + gains only)
+            command = torch.zeros(num_envs, osc.action_dim, device=sim.device)
+
+            # distances from EE to start and end in world frame
+            ee_pos_w = ee_pose_w[:, 0:3]
+            dist_to_start = torch.norm(ee_pos_w - start_pos_w, dim=-1)
+            dist_to_end = torch.norm(ee_pos_w - end_pos_w, dim=-1)
+
+            # masks
+            go_mask = behavior_state == 0
+            push_mask = behavior_state == 1
+
+            # For envs that still need to go to the start point, set pose targets to start_pose_b
+            if go_mask.any():
+                idx = go_mask.nonzero(as_tuple=False).squeeze(-1)
+                command[idx, :7] = start_pose_b[idx]
+                command[idx, 7:13] = default_kp.unsqueeze(0).repeat(len(idx), 1)
+
+                # switch to push when close enough to start
+                arrived = (dist_to_start < 0.005) & go_mask
+                if arrived.any():
+                    behavior_state[arrived] = 1
+
+            # For envs that are in push mode, set wrench and end pose
+            if push_mask.any():
+                idx = push_mask.nonzero(as_tuple=False).squeeze(-1)
+
+                # place end pose as pose target (pure pose control)
+                command[idx, :7] = end_pose_b[idx]
+                command[idx, 7:13] = default_kp.unsqueeze(0).repeat(len(idx), 1)
+
+                # check for completion (reached/passed end point)
+                finished = (dist_to_end < 0.03) & push_mask
+                if finished.any():
+                    behavior_state[finished] = 2
+
+            # For finished envs, keep last command zeroed (or you could set a hold pose)
+            done_mask = behavior_state == 2
+            if done_mask.any():
+                idx = done_mask.nonzero(as_tuple=False).squeeze(-1)
+                command[idx, :7] = end_pose_b[idx]
+                command[idx, 7:13] = default_kp.unsqueeze(0).repeat(len(idx), 1)
+
+            # update OSC with the absolute pose/wrench command in body frame, using
+            # a fixed identity task frame at the robot root
+            osc.set_command(
+                command=command,
+                current_ee_pose_b=ee_pose_b,
+                current_task_frame_pose_b=identity_task_pose_b,
+            )
+
             # compute the joint commands
             joint_efforts = osc.compute(
                 jacobian_b=jacobian_b,
@@ -259,13 +415,22 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 current_joint_vel=joint_vel,
                 nullspace_joint_pos_target=joint_centers,
             )
+
             # apply actions
             robot.set_joint_effort_target(joint_efforts, joint_ids=arm_joint_ids)
             robot.write_data_to_sim()
 
         # update marker positions
         ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
-        goal_marker.visualize(ee_target_pose_w[:, 0:3], ee_target_pose_w[:, 3:7])
+        # choose which world target to visualize: start for state 0, end for state 1 or 2
+        target_pos_w = torch.where(
+            (behavior_state == 0).unsqueeze(-1),
+            start_pos_w,
+            end_pos_w,
+        )
+        target_quat_w = quat_down_world  # same downward orientation
+
+        goal_marker.visualize(target_pos_w, target_quat_w)
 
         # perform step
         sim.step(render=True)
@@ -465,7 +630,7 @@ def main():
     sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device)
     sim = sim_utils.SimulationContext(sim_cfg)
     # Set main camera
-    sim.set_camera_view([2.5, 2.5, 2.5], [0.0, 0.0, 0.0])
+    sim.set_camera_view((2.5, 2.5, 2.5), (0.0, 0.0, 0.0))
     # Design scene
     scene_cfg = SceneCfg(num_envs=args_cli.num_envs, env_spacing=2.0)
     scene = InteractiveScene(scene_cfg)
