@@ -23,14 +23,40 @@ class MassWriter(rep.Writer):
         self.width = width
         self.height = height
         self.use_friction = use_friction
+        # Mapping from prim path -> scalar (e.g. mass). Keys may not
+        # exactly match the instance-id prim paths, so we also build a
+        # normalized-name lookup for fuzzy matching.
         self.mass_lookup = mass_lookup or {}
         self._basic_writer = rep.BasicWriter(output_dir=output_dir, **basic_kwargs)
-
+        
         mode = "friction" if use_friction else "mass"
-        self._scalar_dir = os.path.join(output_dir, mode)
-        os.makedirs(self._scalar_dir, exist_ok=True)
+        # self._scalar_dir = os.path.join(output_dir, mode)
+        self._scalar_dir = output_dir
+        # os.makedirs(self._scalar_dir, exist_ok=True)
 
         self._stage = get_current_stage()
+
+        # Pre-compute a mapping from a normalized leaf-name of the prim
+        # path (last component) to the scalar value. This allows us to
+        # associate masses like "/World/envs/env_0/Object" with
+        # instance-id labels such as
+        # "/World/envs/env_0/Object/geometry/mesh" by matching the
+        # unique "Object" token.
+        self._name_to_scalar = {}
+        for key, value in self.mass_lookup.items():
+            leaf = os.path.basename(key.rstrip("/"))
+            norm = self._normalize_token(leaf)
+            if not norm:
+                continue
+            if norm in self._name_to_scalar and self._name_to_scalar[norm] != value:
+                # If this happens, multiple different masses share the same
+                # normalized name; we keep the first and warn once.
+                print(
+                    f"[MassWriter] Warning: multiple entries share normalized name '{norm}'. "
+                    "Using the first one."
+                )
+                continue
+            self._name_to_scalar[norm] = value
 
     # ------------------------------------------------------------------
 
@@ -89,8 +115,8 @@ class MassWriter(rep.Writer):
             )
 
             scalar = self._get_scalar(prim_path)
-            if scalar is not None and scalar != 0.0:
-                print(f"[MassWriter] Prim: {prim_path}, ID: {inst_id}, Scalar: {scalar}, scalar type: {type(scalar)}")
+            # if scalar is not None and scalar != 0.0:
+            #     print(f"[MassWriter] Prim: {prim_path}, ID: {inst_id}, Scalar: {scalar}, scalar type: {type(scalar)}")
             id_to_scalar[inst_id] = scalar if scalar is not None else 0.0
 
         # -------------------------------------------
@@ -106,11 +132,48 @@ class MassWriter(rep.Writer):
         # Save
         # -------------------------------------------
         frame_id = int(data["trigger_outputs"]["on_time"])
-        out_path = os.path.join(self._scalar_dir, f"{frame_id:06d}.npy")
+        out_path = os.path.join(self._scalar_dir, f"mass_{frame_id:04d}.npy")
         np.save(out_path, scalar_map)
 
     # ------------------------------------------------------------------
 
     def _get_scalar(self, prim_path):
-        return self.mass_lookup.get(prim_path, 0.0)
+        # 1) Exact match on the full prim path.
+        if prim_path in self.mass_lookup:
+            return self.mass_lookup[prim_path]
+
+        # 2) Walk up the prim hierarchy: many label paths point to a
+        #    child (e.g. geometry/mesh). If any parent prim has a
+        #    scalar, use that.
+        parent = prim_path.rstrip("/")
+        while "/" in parent:
+            parent = parent.rsplit("/", 1)[0]
+            if parent in self.mass_lookup:
+                return self.mass_lookup[parent]
+
+        # 3) Fallback: match by normalized leaf-name. We rely on the
+        #    user-provided guarantee that the last component of the
+        #    mass_lookup paths is unique across the scene. We then look
+        #    for that component (normalized) in any segment of the
+        #    instance-id prim path.
+        segments = [seg for seg in prim_path.split("/") if seg]
+        norm_segments = [self._normalize_token(seg) for seg in segments]
+        for norm_seg in norm_segments:
+            if norm_seg in self._name_to_scalar:
+                return self._name_to_scalar[norm_seg]
+
+        # If all strategies fail, fall back to zero (background).
+        return 0.0
+
+    @staticmethod
+    def _normalize_token(token: str) -> str:
+        """Normalize a prim-name token for fuzzy matching.
+
+        Keeps only alphanumeric characters and lowercases them so that
+        names like "link_0", "panda_link0" and "Link0" all normalize
+        to comparable strings (e.g., "link0"). This makes it easier to
+        associate physics prims with visual prims that share a core
+        name but differ in decoration.
+        """
+        return "".join(ch for ch in token if ch.isalnum()).lower()
 

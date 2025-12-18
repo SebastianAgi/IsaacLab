@@ -43,6 +43,7 @@ import omni
 import omni.replicator.core as rep
 
 import isaaclab.sim as sim_utils
+import isaacsim.core.utils.prims as prims_utils
 from isaaclab.assets import Articulation, AssetBaseCfg
 from isaaclab.assets.rigid_object.rigid_object_cfg import RigidObjectCfg, RigidObject
 from isaaclab.controllers import OperationalSpaceController, OperationalSpaceControllerCfg
@@ -62,6 +63,7 @@ from isaaclab.utils.math import (
 )
 
 from mass_writer import MassWriter
+from pxr import Usd, UsdPhysics, PhysxSchema
 
 ##
 # Pre-defined configs
@@ -85,7 +87,7 @@ class SceneCfg(InteractiveSceneCfg):
     # ground plane
     ground = AssetBaseCfg(
         prim_path="/World/defaultGroundPlane",
-        spawn=sim_utils.GroundPlaneCfg(),
+        spawn=sim_utils.GroundPlaneCfg(size=(2000.0, 2000.0)),
     )
 
 
@@ -147,7 +149,7 @@ class SceneCfg(InteractiveSceneCfg):
                 kinematic_enabled=True,
                 disable_gravity=True,
             ),
-
+            mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
             # Affects friction during contacts
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 static_friction=FRICTION_VALUES["table_physics"],
@@ -251,62 +253,81 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
     camera = Camera(cfg=camera_cfg)
     save_camera_data = True
-    camera_id = 0  # which camera to save from (if multiple cameras are present)
-
-    # Camera positions and targets: shape (num_cameras, 3)
-    # Here we use one camera per environment and give them the same pose.
-    # camera_positions = torch.tensor([[12.0, -7.0, 1.25]], device=sim.device).repeat(scene.num_envs, 1)
-    # camera_targets = torch.tensor([[0.0, 0.0, 0.3]], device=sim.device).repeat(scene.num_envs, 1)
+    # number of camera instances (one per env for the regex prim_path)
+    num_cameras = scene.num_envs
 
     camera_positions = torch.tensor([1.0, 0.75, 1.0], device=sim.device).repeat(scene.num_envs, 1)
     camera_targets = torch.tensor([0.0, 0.0, 0.5], device=sim.device).repeat(scene.num_envs, 1)
 
-    # Play the simulator (ensures sensor initialization callbacks are registered
-    # before we start calling their update methods).
+    camera_positions += scene.env_origins
+    camera_targets += scene.env_origins
+
     sim.reset()
-
-    obj = scene.rigid_objects["object"]
-    rb = obj.root_physx_view   # The real PhysX rigid body handle
-
-    rb_masses = rb.get_masses()   # tensor of shape (num_envs,)
-
-    print("Mass:", rb_masses)
-    print("Mass for env 0:", rb_masses[0])
 
     # Set pose: There are two ways to set the pose of the camera.
     camera.set_world_poses_from_view(camera_positions, camera_targets)
 
-    import builtins
-
-    print("camera.is_initialized:", camera.is_initialized)
-    print("callback exception:", getattr(builtins, "ISAACLAB_CALLBACK_EXCEPTION", None))
-
-    # Extract scene entities for readability.
-    robot = scene.articulations["robot"]
-
-    ra = robot.root_physx_view
-    ra_masses = ra.get_masses()
-    print("Robot base masses:", ra_masses)
 
     # ---------------------------------------------------------
     # Build prim → mass lookup dictionary (per-environment)
     # ---------------------------------------------------------
+    obj = scene.rigid_objects["object"]
+    rb = obj.root_physx_view   # The real PhysX rigid body handle
+
+    # print("rb.count =", rb.count)
+
+    # mass_array = torch.ones(rb.count, device=sim.device, dtype=torch.float32)
+    # print("mass_array shape: ", mass_array.shape)
+    # indices = torch.arange(rb.count, device=sim.device)
+
+    # rb.set_masses(mass_array.unsqueeze(-1), indices.unsqueeze(-1))
+
+    rb_masses = rb.get_masses()   # tensor of shape (num_envs,)
+
+    robot = scene.articulations["robot"]
+    ra = robot.root_physx_view
+    link_paths = ra.link_paths
+    ra_masses = ra.get_masses()
+
+    table_physics = scene.rigid_objects["table_physics"]
+    tp_rb = table_physics.root_physx_view
+    tp_masses = tp_rb.get_masses()  # shape (num_envs,)
+
+    # stage = scene.stage
+
+    # prim = stage.GetPrimAtPath("/World/envs/env_0/TablePhysics")
+
+    # # Get the material API
+    # mat_api = PhysxSchema.PhysxMaterialAPI.Get(stage, prim.GetPath())
+
+    # print("physx_mat:", mat_api)
+
+    # if mat_api:
+    #     print("Static friction:", mat_api.GetStaticFrictionAttr().Get())
+    #     print("Dynamic friction:", mat_api.GetDynamicFrictionAttr().Get())
+    # else:
+    #     print("No PhysxPhysicsMaterialAPI on this prim.")
+    
     mass_lookup = {}
 
-    env_origins = scene.env_origins  # shape (num_envs,3)
-
-    # OBJECT MASS (one rigid body)
     for env_id in range(scene.num_envs):
-        prim_path = f"/World/envs/env_{env_id}/Object"
-        mass_lookup[prim_path] = float(rb_masses[env_id])
 
-    # ROBOT LINKS (11 rigid bodies)
-    for env_id in range(scene.num_envs):
-        for body_idx, mass in enumerate(ra_masses[env_id]):
-            prim_path = f"/World/envs/env_{env_id}/Robot/link_{body_idx}"
-            mass_lookup[prim_path] = float(mass)
+        # OBJECT MASS
+        mass_lookup[f"/World/envs/env_{env_id}/Object"] = float(rb_masses[env_id])
 
+        # TABLE PHYSICS PRIM (one rigid body)
+        mass_lookup[f"/World/envs/env_{env_id}/TablePhysics"] = float(tp_masses[env_id])
+        mass_lookup[f"/World/envs/env_{env_id}/TableVisual"] = float(tp_masses[env_id])
+
+        # ROBOT LINKS
+        for link_idx, prim_path in enumerate(link_paths[0]):
+            # Adjust env_0 → env_<env_id>
+            env_prim = prim_path.replace("env_0", f"env_{env_id}")
+
+            mass_lookup[env_prim] = float(ra_masses[env_id, link_idx])
+        
     print("Mass lookup dictionary:", mass_lookup)
+    # exit()
 
     contact_forces = scene["contact_forces"]
     # camera = scene.sensors["camera"]
@@ -317,14 +338,26 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     camera_width = camera.cfg.width
     camera_height = camera.cfg.height
 
-    # Create writer (mass or friction map)
-    writer = MassWriter(
-        output_dir=output_dir,
-        use_friction=False,
-        width=camera_width,
-        height=camera_height,
-        mass_lookup=mass_lookup,   # NEW
-    )
+    # Get current largest env_<idx> folder index to avoid overwriting
+    existing_envs = [d for d in os.listdir(output_dir) if d.startswith("env_")]
+    existing_indices = [int(d.split("_")[1]) for d in existing_envs if d.split("_")[1].isdigit()]   
+    start_env_idx = max(existing_indices) + 1 if existing_indices else 0
+    print("Starting environment index for output folders:", start_env_idx)
+
+    # Create one writer per camera/env so that each env's images are
+    # saved into its own sub-folder: output/camera/env_<idx>/...
+    writers = []
+    for cam_idx in range(num_cameras):
+        env_output_dir = os.path.join(output_dir, f"env_{cam_idx+start_env_idx}")
+        writers.append(
+            MassWriter(
+                output_dir=env_output_dir,
+                use_friction=False,
+                width=camera_width,
+                height=camera_height,
+                mass_lookup=mass_lookup,
+            )
+        )
 
     # Obtain indices for the end-effector and arm joints
     ee_frame_name = "panda_leftfinger"
@@ -344,7 +377,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         gravity_compensation=False,
         motion_damping_ratio_task=1.0,
         # force control stiffness (X/Y axes used during push)
-        contact_wrench_stiffness_task=[0.15, 0.15, 0.0, 0.0, 0.0, 0.0],
+        contact_wrench_stiffness_task=[1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         # position control for all axes; during push, motion along
         # the push direction is primarily governed by wrench control.
         motion_control_axes_task=[1, 1, 1, 1, 1, 1],
@@ -363,8 +396,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Parameters for the randomized circle-push behavior
     circle_radius = 0.15  # meters (distance from cube center to start/end points)
     approach_height = 0.03  # meters above cube for approach
-    push_distance = 0.18  # radial offset for the end point beyond the cube
-    push_force = 2.0  # target force magnitude in Newtons
+    push_distance = 0.07  # radial offset for the end point beyond the cube
+    push_force = 50.0  # target force magnitude in Newtons
 
     # We will control force in the task frame across X/Y (push direction expressed in task frame).
     # OSC will be configured to regulate both X and Y force components so the push direction
@@ -450,10 +483,13 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     joint_efforts = torch.zeros(scene.num_envs, len(arm_joint_ids), device=sim.device)
 
     count = 0
+    episode_length = 300 # steps per episode
+    print("Starting simulation loop...")
     # Simulation loop
     while simulation_app.is_running():
+        # print(f"Step count: {count}/{episode_length}")
         # reset every 150 steps or on a high root z (sanity)
-        if count % 200 == 0 or (root_pose_w[:, 2] > 0.5).any():
+        if count % episode_length == 0 or (root_pose_w[:, 2] > 0.5).any():
             # reset joint state to default
             default_joint_pos = robot.data.default_joint_pos.clone()
             default_joint_vel = robot.data.default_joint_vel.clone()
@@ -480,7 +516,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
             # end on the opposite side of a slightly larger circle to
             # ensure we go through the cube
-            end_radius = circle_radius #+ push_distance
+            end_radius = circle_radius #- push_distance
             end_pos_w[:, 0] = cube_pos_w[:, 0] - cos_a * end_radius
             end_pos_w[:, 1] = cube_pos_w[:, 1] - sin_a * end_radius
             end_pos_w[:, 2] = cube_pos_w[:, 2] + approach_height
@@ -522,6 +558,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
             # reset behavior state
             behavior_state[:] = 0
+
+            # randomize push_force for next episode
+            push_force_rand = push_force * torch.rand(num_envs, device=sim.device)
+            print("Sampled push forces:", push_force_rand)
+
         else:
             # get the updated states
             (
@@ -571,7 +612,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 # desired push direction (world): from start to end (normalized)
                 push_dir = end_pos_w[idx] - start_pos_w[idx]
                 push_dir = push_dir / (torch.norm(push_dir, dim=-1, keepdim=True) + 1e-8)
-                desired_world_force = push_dir * push_force
+                desired_world_force = push_dir * push_force_rand[idx].unsqueeze(-1)
 
                 # map desired force from world -> root/task frame. Since we
                 # provide an identity task frame at the robot root in
@@ -643,7 +684,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         scene.update(sim_dt)
         # update sim-time
         count += 1
-        if count == 201:
+        if count == episode_length + 1:
             exit()
 
         # Update camera data   
@@ -651,29 +692,29 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
         # Extract camera data
         if save_camera_data:
-            # Save images from camera at camera_index
-            camera_index = camera_id
+            # Save images from all cameras/envs
+            for cam_idx in range(num_cameras):
+                # note: BasicWriter only supports saving data in numpy format, so we need to convert the data to numpy.
+                single_cam_data = convert_dict_to_backend(
+                    {k: v[cam_idx] for k, v in camera.data.output.items()}, backend="numpy"
+                )
 
-            # note: BasicWriter only supports saving data in numpy format, so we need to convert the data to numpy.
-            single_cam_data = convert_dict_to_backend(
-                {k: v[camera_index] for k, v in camera.data.output.items()}, backend="numpy"
-            )
+                # Extract the other information
+                single_cam_info = camera.data.info[cam_idx]
 
-            # Extract the other information
-            single_cam_info = camera.data.info[camera_index]
-
-            # Pack data back into replicator format to save them using its writer
-            rep_output = {"annotators": {}}
-            for key, data, info in zip(single_cam_data.keys(), single_cam_data.values(), single_cam_info.values()):
-                if info is not None:
-                    rep_output["annotators"][key] = {"render_product": {"data": data, **info}}
-                else:
-                    rep_output["annotators"][key] = {"render_product": {"data": data}}
-            # Save images
-            # Note: We need to provide On-time data for Replicator to save the images.
-            rep_output["trigger_outputs"] = {"on_time": camera.frame[camera_index]}
-            # rep_writer.write(rep_output)
-            writer.write(rep_output)
+                # Pack data back into replicator format to save them using its writer
+                rep_output = {"annotators": {}}
+                for key, data, info in zip(
+                    single_cam_data.keys(), single_cam_data.values(), single_cam_info.values()
+                ):
+                    if info is not None:
+                        rep_output["annotators"][key] = {"render_product": {"data": data, **info}}
+                    else:
+                        rep_output["annotators"][key] = {"render_product": {"data": data}}
+                # Save images
+                # Note: We need to provide On-time data for Replicator to save the images.
+                rep_output["trigger_outputs"] = {"on_time": camera.frame[cam_idx]}
+                writers[cam_idx].write(rep_output)
 
         # # Print camera info
         # print(camera)
@@ -871,12 +912,12 @@ def convert_to_task_frame(osc: OperationalSpaceController, command: torch.tensor
 def main():
     """Main function."""
     # Load kit helper
-    sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device)
+    sim_cfg = sim_utils.SimulationCfg(dt=0.005, device=args_cli.device)
     sim = sim_utils.SimulationContext(sim_cfg)
     # Set main camera
     sim.set_camera_view((2.5, 2.5, 2.5), (0.0, 0.0, 0.0))
     # Design scene
-    scene_cfg = SceneCfg(num_envs=args_cli.num_envs, env_spacing=2.0)
+    scene_cfg = SceneCfg(num_envs=args_cli.num_envs, env_spacing=40.0)
     scene = InteractiveScene(scene_cfg)
     # Now we are ready!
     print("[INFO]: Setup complete...")

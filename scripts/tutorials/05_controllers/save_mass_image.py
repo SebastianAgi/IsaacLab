@@ -113,3 +113,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# Example usage:
+# python save_mass_image.py --input /path/to/mass/000038.npy --cmap plasma
